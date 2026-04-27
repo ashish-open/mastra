@@ -15,6 +15,11 @@ const sidebars = {
       collapsed: true,
       items: [
         { type: 'doc', id: 'agents/agent', label: 'Agent Class' },
+        {
+          type: 'doc',
+          id: 'agents/channels',
+          label: 'Channels',
+        },
         { type: 'doc', id: 'agents/generate', label: '.generate()' },
         { type: 'doc', id: 'agents/generateLegacy', label: '.generateLegacy()' },
         {
@@ -52,6 +57,7 @@ const sidebars = {
         { type: 'doc', id: 'ai-sdk/handle-network-stream', label: 'handleNetworkStream()' },
         { type: 'doc', id: 'ai-sdk/handle-workflow-stream', label: 'handleWorkflowStream()' },
         { type: 'doc', id: 'ai-sdk/network-route', label: 'networkRoute()' },
+        { type: 'doc', id: 'ai-sdk/to-ai-sdk-messages', label: 'toAISdkMessages()' },
         { type: 'doc', id: 'ai-sdk/to-ai-sdk-stream', label: 'toAISdkStream()' },
         { type: 'doc', id: 'ai-sdk/to-ai-sdk-v4-messages', label: 'toAISdkV4Messages()' },
         { type: 'doc', id: 'ai-sdk/to-ai-sdk-v5-messages', label: 'toAISdkV5Messages()' },
@@ -76,6 +82,17 @@ const sidebars = {
     },
     {
       type: 'category',
+      label: 'Browser',
+      collapsed: true,
+      items: [
+        { type: 'doc', id: 'browser/agent-browser', label: 'AgentBrowser' },
+        { type: 'doc', id: 'browser/browser-viewer', label: 'BrowserViewer' },
+        { type: 'doc', id: 'browser/mastra-browser', label: 'MastraBrowser Class' },
+        { type: 'doc', id: 'browser/stagehand-browser', label: 'StagehandBrowser' },
+      ],
+    },
+    {
+      type: 'category',
       label: 'CLI',
       collapsed: true,
       items: [
@@ -93,7 +110,6 @@ const sidebars = {
           type: 'doc',
           id: 'client-js/conversations',
           label: 'Conversations API',
-          customProps: { tags: ['new'] },
         },
         { type: 'doc', id: 'client-js/error-handling', label: 'Error Handling' },
         { type: 'doc', id: 'client-js/logs', label: 'Logs API' },
@@ -104,7 +120,6 @@ const sidebars = {
           type: 'doc',
           id: 'client-js/responses',
           label: 'Responses API',
-          customProps: { tags: ['new'] },
         },
         { type: 'doc', id: 'client-js/telemetry', label: 'Telemetry API' },
         { type: 'doc', id: 'client-js/tools', label: 'Tools API' },
@@ -123,6 +138,7 @@ const sidebars = {
         { type: 'doc', id: 'core/getAgent', label: '.getAgent()' },
         { type: 'doc', id: 'core/getAgentById', label: '.getAgentById()' },
         { type: 'doc', id: 'core/getDeployer', label: '.getDeployer()' },
+        { type: 'doc', id: 'core/getEditor', label: '.getEditor()' },
         { type: 'doc', id: 'core/getGateway', label: '.getGateway()' },
         { type: 'doc', id: 'core/getGatewayById', label: '.getGatewayById()' },
         { type: 'doc', id: 'core/getLogger', label: '.getLogger()' },
@@ -158,6 +174,15 @@ const sidebars = {
         { type: 'doc', id: 'deployer/index', label: 'Deployer' },
         { type: 'doc', id: 'deployer/netlify', label: 'Netlify' },
         { type: 'doc', id: 'deployer/vercel', label: 'Vercel' },
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Editor',
+      collapsed: true,
+      items: [
+        { type: 'doc', id: 'editor/mastra-editor', label: 'MastraEditor Class' },
+        { type: 'doc', id: 'editor/tool-provider', label: 'ToolProvider' },
       ],
     },
     {
@@ -243,6 +268,12 @@ const sidebars = {
     },
     {
       type: 'category',
+      label: 'Mastra Platform',
+      collapsed: true,
+      items: [{ type: 'doc', id: 'mastra-platform/api', label: 'API Reference' }],
+    },
+    {
+      type: 'category',
       label: 'Memory',
       collapsed: true,
       items: [
@@ -270,7 +301,13 @@ const sidebars = {
         {
           type: 'category',
           label: 'Metrics',
-          items: [{ type: 'doc', id: 'observability/metrics/automatic-metrics', label: 'Automatic Metrics' }],
+          items: [
+            {
+              type: 'doc',
+              id: 'observability/metrics/automatic-metrics',
+              label: 'Automatic Metrics',
+            },
+          ],
         },
         {
           type: 'category',
@@ -279,6 +316,7 @@ const sidebars = {
             { type: 'doc', id: 'observability/tracing/configuration', label: 'Configuration' },
             { type: 'doc', id: 'observability/tracing/instances', label: 'Instances' },
             { type: 'doc', id: 'observability/tracing/interfaces', label: 'Interfaces' },
+            { type: 'doc', id: 'observability/tracing/span-filtering', label: 'Span filtering' },
             { type: 'doc', id: 'observability/tracing/spans', label: 'Spans' },
             {
               type: 'category',
@@ -290,6 +328,7 @@ const sidebars = {
               label: 'Exporters',
               items: [
                 { type: 'doc', id: 'observability/tracing/exporters/arize', label: 'Arize' },
+                { type: 'doc', id: 'observability/tracing/exporters/arthur', label: 'Arthur' },
                 {
                   type: 'doc',
                   id: 'observability/tracing/exporters/braintrust',
@@ -348,6 +387,7 @@ const sidebars = {
         { type: 'doc', id: 'processors/message-history-processor', label: 'MessageHistory' },
         { type: 'doc', id: 'processors/moderation-processor', label: 'ModerationProcessor' },
         { type: 'doc', id: 'processors/pii-detector', label: 'PIIDetector' },
+        { type: 'doc', id: 'processors/prefill-error-handler', label: 'PrefillErrorHandler' },
         { type: 'doc', id: 'processors/processor-interface', label: 'Processor Interface' },
         {
           type: 'doc',
@@ -411,6 +451,7 @@ const sidebars = {
         { type: 'doc', id: 'storage/mongodb', label: 'MongoDB Storage' },
         { type: 'doc', id: 'storage/mssql', label: 'MSSQL Storage' },
         { type: 'doc', id: 'storage/postgresql', label: 'PostgreSQL Storage' },
+        { type: 'doc', id: 'storage/redis', label: 'Redis Storage' },
         { type: 'doc', id: 'storage/upstash', label: 'Upstash Storage' },
       ],
     },
@@ -462,6 +503,7 @@ const sidebars = {
         { type: 'doc', id: 'tools/vector-query-tool', label: 'createVectorQueryTool()' },
         { type: 'doc', id: 'tools/mcp-client', label: 'MCPClient' },
         { type: 'doc', id: 'tools/mcp-server', label: 'MCPServer' },
+        { type: 'doc', id: 'tools/tavily', label: 'Tavily Tools' },
       ],
     },
     {
@@ -569,10 +611,12 @@ const sidebars = {
         { type: 'doc', id: 'workspace/agentfs-filesystem', label: 'AgentFSFilesystem' },
         { type: 'doc', id: 'workspace/blaxel-sandbox', label: 'BlaxelSandbox' },
         { type: 'doc', id: 'workspace/daytona-sandbox', label: 'DaytonaSandbox' },
+        { type: 'doc', id: 'workspace/docker-sandbox', label: 'DockerSandbox' },
         { type: 'doc', id: 'workspace/e2b-sandbox', label: 'E2BSandbox' },
         { type: 'doc', id: 'workspace/gcs-filesystem', label: 'GCSFilesystem' },
         { type: 'doc', id: 'workspace/local-filesystem', label: 'LocalFilesystem' },
         { type: 'doc', id: 'workspace/local-sandbox', label: 'LocalSandbox' },
+        { type: 'doc', id: 'workspace/modal-sandbox', label: 'ModalSandbox' },
         { type: 'doc', id: 'workspace/s3-filesystem', label: 'S3Filesystem' },
         { type: 'doc', id: 'workspace/process-manager', label: 'SandboxProcessManager' },
         { type: 'doc', id: 'workspace/vercel', label: 'VercelSandbox' },

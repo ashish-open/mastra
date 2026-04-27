@@ -30,6 +30,7 @@ import {
   agentWithSequentialModeration,
   supervisorAgent,
   subscriptionOrchestratorAgent,
+  cryptoResearchAgent,
 } from './agents/model-v2-agent';
 import { myWorkflowX, nestedWorkflow, findUserWorkflow } from './workflows/other';
 import { moderationProcessor } from './agents/model-v2-agent';
@@ -87,6 +88,7 @@ const config = {
     agentWithSequentialModeration,
     supervisorAgent,
     subscriptionOrchestratorAgent,
+    cryptoResearchAgent,
   },
   processors: {
     moderationProcessor,
@@ -114,14 +116,19 @@ const config = {
     sourcemap: true,
   },
   editor: new MastraEditor(),
-  // server: {
-  //   auth: mastraAuth,
-  //   rbac: rbacProvider,
-  // },
+  server: {
+    auth: mastraAuth,
+    rbac: rbacProvider,
+  },
 };
 
 export const mastra = new Mastra({
   ...config,
+  backgroundTasks: {
+    enabled: true,
+    globalConcurrency: 10,
+    perAgentConcurrency: 5,
+  },
   editor: new MastraEditor({
     toolProviders: {
       composio: new ComposioToolProvider({ apiKey: '' }),

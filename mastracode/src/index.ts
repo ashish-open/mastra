@@ -1,4 +1,5 @@
 import { Agent } from '@mastra/core/agent';
+import type { MastraBrowser } from '@mastra/core/browser';
 import { Harness } from '@mastra/core/harness';
 import type {
   CustomAvailableModel,
@@ -8,8 +9,8 @@ import type {
   HarnessSubagent,
 } from '@mastra/core/harness';
 import { GatewayRegistry, PROVIDER_REGISTRY } from '@mastra/core/llm';
-import type { ProviderConfig } from '@mastra/core/llm';
-import { AgentsMDInjector } from '@mastra/core/processors';
+import type { LanguageModel, ProviderConfig } from '@mastra/core/llm';
+import { AgentsMDInjector, PrefillErrorHandler, ProviderHistoryCompat } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
 
 import { getDynamicInstructions } from './agents/instructions.js';
@@ -33,7 +34,7 @@ import {
   loadSettings,
   MEMORY_GATEWAY_PROVIDER,
   resolveModelDefaults,
-  resolveOmModel,
+  resolveOmRoleModel,
   saveSettings,
   toCustomProviderModelId,
 } from './onboarding/settings.js';
@@ -59,7 +60,7 @@ export interface MastraCodeConfig {
   /** Working directory for project detection. Default: process.cwd() */
   cwd?: string;
   /** Override modes (model IDs, colors, which modes exist). Default: build/plan/fast */
-  modes?: HarnessMode[];
+  modes?: HarnessMode<Record<string, unknown>>[];
   /** Override or extend subagent definitions. Default: explore/plan/execute */
   subagents?: HarnessSubagent[];
   /** Extra tools merged into the dynamic tool set. Can be a static record or a function that receives requestContext. */
@@ -80,6 +81,8 @@ export interface MastraCodeConfig {
   storage?: StorageConfig;
   /** Observational memory scope. Default: auto-detected from env/config files, falls back to 'thread' */
   omScope?: 'thread' | 'resource';
+  /** Path to a custom settings.json file. Default: global settings */
+  settingsPath?: string;
   /** Initial state overrides (yolo, thinkingLevel, etc.) */
   initialState?: Record<string, unknown>;
   /** Override heartbeat handlers. Default: gateway-sync */
@@ -92,6 +95,8 @@ export interface MastraCodeConfig {
   disableMcp?: boolean;
   /** Disable hooks. Default: false */
   disableHooks?: boolean;
+  /** Browser provider for browser automation tools. When set, the agent gains access to browser tools. */
+  browser?: MastraBrowser;
 }
 
 export function createAuthStorage() {
@@ -108,7 +113,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
 
   // Auth storage (shared with Claude Max / OpenAI providers and Harness)
   const authStorage = createAuthStorage();
-  const globalSettings = loadSettings();
+  const globalSettings = loadSettings(config?.settingsPath);
   const storedGatewayKey = authStorage.getStoredApiKey(MEMORY_GATEWAY_PROVIDER);
   const storedGatewayUrl = globalSettings.memoryGateway?.baseUrl;
 
@@ -193,7 +198,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
     inputProcessors: [
       new AgentsMDInjector({
         getIgnoredInstructionPaths: ({ requestContext }) => {
-          const harnessContext = requestContext.get('harness') as
+          const harnessContext = requestContext?.get('harness') as
             | { state?: { projectPath?: string }; getState?: () => { projectPath?: string } }
             | undefined;
           const projectPath =
@@ -202,11 +207,12 @@ export async function createMastraCode(config?: MastraCodeConfig) {
         },
       }),
     ],
+    errorProcessors: [new PrefillErrorHandler(), new ProviderHistoryCompat()],
   });
 
   const defaultSubagents = [exploreSubagent, planSubagent, executeSubagent];
 
-  const defaultModes: HarnessMode[] = [
+  const defaultModes: HarnessMode<Record<string, unknown>>[] = [
     {
       id: 'build',
       name: 'Build',
@@ -270,7 +276,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
   try {
     const registry = PROVIDER_REGISTRY as Record<string, ProviderConfig>;
     for (const [provider, config] of Object.entries(registry)) {
-      if (startupAccess[provider] && startupAccess[provider] !== false) continue; // Already enabled above
+      if (startupAccess[provider] === 'oauth' || startupAccess[provider] === 'apikey') continue; // Already enabled above
       if (provider === 'anthropic' || provider === 'openai') continue;
       const envVars = config?.apiKeyEnvVar;
       const envVarList = Array.isArray(envVars) ? envVars : envVars ? [envVars] : [];
@@ -284,7 +290,8 @@ export async function createMastraCode(config?: MastraCodeConfig) {
   const builtinPacks = getAvailableModePacks(startupAccess);
   const builtinOmPacks = getAvailableOmPacks(startupAccess);
   const effectiveDefaults = resolveModelDefaults(globalSettings, builtinPacks);
-  const effectiveOmModel = resolveOmModel(globalSettings, builtinOmPacks);
+  const effectiveObserverModel = resolveOmRoleModel(globalSettings, 'observer', builtinOmPacks);
+  const effectiveReflectorModel = resolveOmRoleModel(globalSettings, 'reflector', builtinOmPacks);
   const effectiveObservationThreshold = globalSettings.models.omObservationThreshold ?? undefined;
   const effectiveReflectionThreshold = globalSettings.models.omReflectionThreshold ?? undefined;
 
@@ -321,9 +328,11 @@ export async function createMastraCode(config?: MastraCodeConfig) {
 
   // Build initial state with global preferences
   const globalInitialState: Record<string, unknown> = {};
-  if (effectiveOmModel) {
-    globalInitialState.observerModelId = effectiveOmModel;
-    globalInitialState.reflectorModelId = effectiveOmModel;
+  if (effectiveObserverModel) {
+    globalInitialState.observerModelId = effectiveObserverModel;
+  }
+  if (effectiveReflectorModel) {
+    globalInitialState.reflectorModelId = effectiveReflectorModel;
   }
   if (effectiveObservationThreshold !== undefined) {
     globalInitialState.observationThreshold = effectiveObservationThreshold;
@@ -340,7 +349,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
   }
   // Seed subagent models from global settings
   for (const [key, modelId] of Object.entries(globalSettings.models.subagentModels)) {
-    if (key === '_default') {
+    if (key === 'default' || key === '_default') {
       globalInitialState.subagentModelId = modelId;
     } else {
       globalInitialState[`subagentModelId_${key}`] = modelId;
@@ -353,7 +362,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
     memory,
     stateSchema,
     subagents,
-    resolveModel,
+    resolveModel: modelId => resolveModel(modelId) as LanguageModel,
     toolCategoryResolver: getToolCategory,
     initialState: {
       projectPath: project.rootPath,
@@ -364,6 +373,7 @@ export async function createMastraCode(config?: MastraCodeConfig) {
       ...config?.initialState,
     },
     workspace: config?.workspace ?? getDynamicWorkspace,
+    browser: config?.browser,
     modes,
     heartbeatHandlers: config?.heartbeatHandlers ?? defaultHeartbeatHandlers,
     modelAuthChecker: provider => {
@@ -447,5 +457,15 @@ export async function createMastraCode(config?: MastraCodeConfig) {
     });
   }
 
-  return { harness, mcpManager, hookManager, authStorage, resolveModel, storageWarning };
+  return {
+    harness,
+    mcpManager,
+    hookManager,
+    authStorage,
+    resolveModel,
+    storageWarning,
+    builtinPacks,
+    builtinOmPacks,
+    effectiveDefaults,
+  };
 }

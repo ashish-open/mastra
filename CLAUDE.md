@@ -51,6 +51,15 @@ pnpm changeset -s -m "Fixed Y bug" --patch @mastra/memory
 
 See `.mastracode/commands/changeset.md` for message guidelines and multi-package rules.
 
+### Watch mode (faster iteration)
+
+```bash
+pnpm turbo watch build --filter="@mastra/core"   # rebuild on save for one package
+pnpm turbo watch build --filter="@mastra/core" --filter="mastra"  # multiple packages
+```
+
+Then test in `examples/agent` with `pnpm install --ignore-workspace && pnpm mastra:dev`.
+
 ### Integration tests
 
 ```bash

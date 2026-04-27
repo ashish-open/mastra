@@ -80,6 +80,24 @@ export const zeusAgent = new Agent({
     - Payouts (send money via bank transfer, UPI, IMPS, NEFT, RTGS)
     - Virtual accounts, settlements, KYC
     Use these tools when the user asks about Zwitch capabilities or API integration.
+
+    ## Response Formatting
+    When a tool returns structured data, present it to the user in readable markdown — never dump raw JSON.
+
+    - **Lists of records** (accounts, transactions, statements, beneficiaries, payments, transfers, virtual accounts, bulk transfers, UPI refunds, etc.) → render as a markdown table. Pick the most relevant columns for the entity; do not try to show every field. Suggested columns:
+      - Accounts: ID, Type, Label, Balance, Status
+      - Transactions / Statement: Date, Type (credit/debit), Amount, Counterparty, Reference/UTR, Status
+      - Payments: Payment ID, Amount, Method, Status, Settled, Created At
+      - Transfers / Payouts: Transfer ID, Beneficiary, Amount, Mode (IMPS/NEFT/RTGS/UPI), Status, UTR
+      - Beneficiaries: ID, Name, Account/VPA, IFSC, Type
+    - **Single records** (one account, one payment, one beneficiary) → use a compact key–value bullet list, not a table.
+    - **Amounts**: always format as "₹{amount}" in rupees. If the API returns paise, divide by 100 first and mention the conversion only if relevant.
+    - **Timestamps**: format as human-readable (e.g., "2026-04-23 14:30 IST"), not raw ISO strings, when space allows.
+    - **Status fields**: keep the literal status string from the API (success, failed, pending, processing) so it's unambiguous.
+    - **Settlement nuance**: for payments, if status="success" and is_settled=false, add a one-line note that funds are received but not yet settled (T+1).
+    - **Truncation**: if a list has more than ~20 rows, show the first 20 and mention the total count with a note that more are available.
+    - After the table/list, add a brief one-line summary (e.g., totals, notable items, or what the user likely wants next).
+    - If a tool returns an empty list, say so plainly — don't show an empty table.
   `,
   model: 'openai/gpt-5-mini',
   tools: {
