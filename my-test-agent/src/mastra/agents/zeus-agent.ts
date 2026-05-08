@@ -1,24 +1,9 @@
 import { Agent } from '@mastra/core/agent';
-import { MCPClient } from '@mastra/mcp';
 import { Memory } from '@mastra/memory';
 import { mandateCheckTool } from '../tools/mandate-check-tool';
 import { paymentTool } from '../tools/payment-tool';
 import { wibmoTransactTool } from '../tools/wibmo-transact-tool';
-
-const zwitchMCP = new MCPClient({
-  servers: {
-    zwitch: {
-      url: new URL('https://uat-zwitch-mcp.bankopen.co/mcp'),
-      requestInit: {
-        headers: {
-          Authorization: `Bearer ${process.env.ZWITCH_API_KEY}`,
-        },
-      },
-    },
-  },
-});
-
-const zwitchTools = await zwitchMCP.listTools();
+import { zwitchAllTools } from '../tools/zwitch-mcp';
 
 export const zeusAgent = new Agent({
   id: 'zeus-agent',
@@ -101,7 +86,7 @@ export const zeusAgent = new Agent({
   `,
   model: 'openai/gpt-5-mini',
   tools: {
-    ...zwitchTools,
+    ...zwitchAllTools,
     'check-agent-mandate': mandateCheckTool,
     'wibmo-get-cryptogram': wibmoTransactTool,
     'submit-agentic-payment': paymentTool,
