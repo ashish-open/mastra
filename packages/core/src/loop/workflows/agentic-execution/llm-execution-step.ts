@@ -16,7 +16,8 @@ import type { IMastraLogger } from '../../../logger';
 import { ConsoleLogger } from '../../../logger';
 import { createObservabilityContext, SpanType } from '../../../observability';
 import { executeWithContextSync } from '../../../observability/utils';
-import type { ProcessorStreamWriter } from '../../../processors/index';
+import type { InputProcessorOrWorkflow, ProcessorStreamWriter } from '../../../processors/index';
+import { isProcessorWorkflow } from '../../../processors/index';
 import { PrepareStepProcessor } from '../../../processors/processors/prepare-step';
 import { ProcessorRunner } from '../../../processors/runner';
 import { RequestContext } from '../../../request-context';
@@ -31,7 +32,7 @@ import type {
   StreamTransport,
   StreamTransportRef,
 } from '../../../stream/types';
-import { ChunkFrom } from '../../../stream/types';
+import { ChunkFrom, readModelStreamTransport } from '../../../stream/types';
 import { findProviderToolByName, inferProviderExecuted } from '../../../tools/provider-tool-utils';
 import type { ToolToConvert } from '../../../tools/tool-builder/builder';
 import { isMastraTool } from '../../../tools/toolchecks';
@@ -43,6 +44,35 @@ import { AgenticRunState } from '../run-state';
 import { llmIterationOutputSchema } from '../schema';
 import { buildMessagesFromChunks } from './build-messages-from-chunks';
 import type { CollectedChunk } from './build-messages-from-chunks';
+import { resolveConfiguredToolCallConcurrency, updateToolCallForeachConcurrency } from './tool-call-concurrency';
+import type { ToolCallForeachOptions } from './tool-call-concurrency';
+
+function getRequestInputProcessors({
+  inputProcessors,
+  llmRequestInputProcessors,
+}: {
+  inputProcessors?: InputProcessorOrWorkflow[];
+  llmRequestInputProcessors?: InputProcessorOrWorkflow[];
+}): InputProcessorOrWorkflow[] {
+  if (!llmRequestInputProcessors?.length) {
+    return inputProcessors || [];
+  }
+
+  if (!inputProcessors?.length) {
+    return llmRequestInputProcessors;
+  }
+
+  const requestProcessorIds = new Set(
+    llmRequestInputProcessors.filter(processor => !isProcessorWorkflow(processor)).map(processor => processor.id),
+  );
+  const additionalInputProcessors = inputProcessors.filter(
+    processor => !isProcessorWorkflow(processor) && !requestProcessorIds.has(processor.id),
+  );
+
+  return additionalInputProcessors.length
+    ? [...llmRequestInputProcessors, ...additionalInputProcessors]
+    : llmRequestInputProcessors;
+}
 
 type ProcessOutputStreamOptions<OUTPUT = undefined> = {
   tools?: ToolSet;
@@ -79,6 +109,67 @@ function buildResponseModelMetadata(
   }
 
   return Object.keys(metadata).length > 0 ? { metadata } : undefined;
+}
+
+function buildTripWireBailResponse<OUTPUT = undefined, TOOLS extends ToolSet = ToolSet>({
+  error,
+  controller,
+  runId,
+  model,
+  messageList,
+  messageId,
+  stepTools,
+  _internal,
+}: {
+  error: TripWire;
+  controller: ReadableStreamDefaultController<ChunkType<OUTPUT>>;
+  runId: string;
+  model: MastraLanguageModel;
+  messageList: MessageList;
+  messageId: string;
+  stepTools?: TOOLS;
+  _internal: OuterLLMRun<TOOLS, OUTPUT>['_internal'];
+}) {
+  const tripwireChunk: ChunkType<OUTPUT> = {
+    type: 'tripwire',
+    runId,
+    from: ChunkFrom.AGENT,
+    payload: {
+      reason: error.message,
+      retry: error.options?.retry,
+      metadata: error.options?.metadata,
+      processorId: error.processorId,
+    },
+  };
+
+  safeEnqueue(controller, tripwireChunk);
+
+  const runState = new AgenticRunState({
+    _internal,
+    model,
+  });
+
+  return {
+    callBail: true,
+    outputStream: new MastraModelOutput<OUTPUT>({
+      model: {
+        modelId: model.modelId,
+        provider: model.provider,
+        version: model.specificationVersion,
+      },
+      stream: new ReadableStream({
+        start(c) {
+          c.enqueue(tripwireChunk);
+          c.close();
+        },
+      }),
+      messageList,
+      messageId,
+      options: { runId },
+    }),
+    runState,
+    stepTools,
+  };
 }
 
 async function processOutputStream<OUTPUT = undefined>({
@@ -345,6 +436,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
   structuredOutput,
   outputProcessors,
   inputProcessors,
+  llmRequestInputProcessors,
   errorProcessors,
   logger,
   agentId,
@@ -353,13 +445,17 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
   processorStates,
   requestContext,
   methodType,
+  requireToolApproval,
+  toolCallConcurrency,
+  toolCallForeachOptions,
   modelSpanTracker,
   autoResumeSuspendedTools,
   maxProcessorRetries,
   workspace,
   outputWriter,
-}: OuterLLMRun<TOOLS, OUTPUT>) {
+}: OuterLLMRun<TOOLS, OUTPUT> & { toolCallForeachOptions?: ToolCallForeachOptions }) {
   const initialSystemMessages = messageList.getAllSystemMessages();
+  const configuredToolCallConcurrency = resolveConfiguredToolCallConcurrency(toolCallConcurrency);
 
   let currentIteration = 0;
 
@@ -384,7 +480,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
       // Start the MODEL_STEP span at the beginning of LLM execution
       modelSpanTracker?.startStep();
 
-      let modelResult;
+      let modelResult: ReturnType<typeof execute> | undefined;
       let warnings: any;
       let request: any;
       let rawResponse: any;
@@ -589,46 +685,16 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                   processorId: error.processorId,
                   retry: error.options?.retry,
                 });
-                // Emit tripwire chunk to the stream
-                safeEnqueue(controller, {
-                  type: 'tripwire',
+                return buildTripWireBailResponse({
+                  error,
+                  controller,
                   runId,
-                  from: ChunkFrom.AGENT,
-                  payload: {
-                    reason: error.message,
-                    retry: error.options?.retry,
-                    metadata: error.options?.metadata,
-                    processorId: error.processorId,
-                  },
-                });
-
-                // Create a minimal runState for the bail response
-                const runState = new AgenticRunState({
-                  _internal: _internal!,
                   model,
-                });
-
-                // Return via bail to properly signal the tripwire
-                return {
-                  callBail: true,
-                  outputStream: new MastraModelOutput({
-                    model: {
-                      modelId: model.modelId,
-                      provider: model.provider,
-                      version: model.specificationVersion,
-                    },
-                    stream: new ReadableStream({
-                      start(c) {
-                        c.close();
-                      },
-                    }),
-                    messageList,
-                    messageId: currentStep.messageId,
-                    options: { runId },
-                  }),
-                  runState,
+                  messageList,
+                  messageId: currentStep.messageId,
                   stepTools: tools,
-                };
+                  _internal: _internal!,
+                });
               }
               logger?.error('Error in processInputStep processors:', error);
               throw error;
@@ -638,6 +704,15 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           // Store activeTools on _internal so toolCallStep can enforce them
           if (_internal) {
             _internal.stepActiveTools = currentStep.activeTools as string[] | undefined;
+          }
+
+          if (toolCallForeachOptions) {
+            updateToolCallForeachConcurrency(toolCallForeachOptions, {
+              requireToolApproval,
+              tools: currentStep.tools,
+              activeTools: currentStep.activeTools as string[] | undefined,
+              configuredConcurrency: configuredToolCallConcurrency,
+            });
           }
 
           const runState = new AgenticRunState({
@@ -739,6 +814,59 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
             });
           }
 
+          // Run `processLLMRequest` for any input processors that implement it.
+          // This hook lets processors rewrite the outbound prompt transiently
+          // without persisting changes back to the message list.
+          {
+            const requestStepRunner = new ProcessorRunner({
+              inputProcessors: getRequestInputProcessors({ inputProcessors, llmRequestInputProcessors }),
+              outputProcessors: [],
+              logger: logger || new ConsoleLogger({ level: 'error' }),
+              agentName: agentId || 'unknown',
+              processorStates,
+            });
+            const requestStepWriter: ProcessorStreamWriter | undefined = outputWriter
+              ? {
+                  custom: async (data: { type: string }, options?: { messageId?: string }) =>
+                    outputWriter(data as ChunkType, { ...options, messageId: currentStep.messageId }),
+                }
+              : undefined;
+            try {
+              const requestStepResult = await requestStepRunner.runProcessLLMRequest({
+                prompt: inputMessages,
+                model: currentStep.model,
+                stepNumber: inputData.output?.steps?.length || 0,
+                steps: inputData.output?.steps || [],
+                retryCount: inputData.processorRetryCount || 0,
+                requestContext,
+                tracingContext: modelSpanTracker?.getTracingContext() ?? tracingContext,
+                writer: requestStepWriter,
+                abortSignal: options?.abortSignal,
+              });
+              inputMessages = requestStepResult.prompt;
+            } catch (error) {
+              if (error instanceof TripWire) {
+                logger?.warn('Streaming request processor tripwire triggered', {
+                  reason: error.message,
+                  processorId: error.processorId,
+                  retry: error.options?.retry,
+                });
+                return buildTripWireBailResponse({
+                  error,
+                  controller,
+                  runId,
+                  model: currentStep.model,
+                  messageList,
+                  messageId: currentStep.messageId,
+                  stepTools: currentStep.tools,
+                  _internal: _internal!,
+                });
+              }
+              logger?.error('Error in processLLMRequest processors:', error);
+              throw error;
+            }
+          }
+
           if (isSupportedLanguageModel(currentStep.model)) {
             modelResult = executeWithContextSync({
               span: modelSpanTracker?.getTracingContext()?.currentSpan,
@@ -786,6 +914,13 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                     request = requestFromStream || {};
                     rawResponse = rawResponseFromStream;
 
+                    modelSpanTracker?.updateStep?.({
+                      request: request || {},
+                      inputMessages,
+                      warnings: warnings || [],
+                      messageId: currentStep.messageId,
+                    });
+
                     safeEnqueue(controller, {
                       runId,
                       from: ChunkFrom.AGENT,
@@ -831,7 +966,7 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           let transportResolver: (() => StreamTransport | undefined) | undefined;
           if (currentStep.model instanceof ModelRouterLanguageModel) {
             const routerModel = currentStep.model;
-            transportResolver = () => routerModel._getStreamTransport();
+            transportResolver = () => readModelStreamTransport(modelResult) ?? routerModel._getStreamTransport();
           }
 
           try {
@@ -884,6 +1019,24 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
           } catch (error) {
             const provider = model?.provider;
             const modelIdStr = model?.modelId;
+
+            // Handle abort first — a client-disconnect mid-stream is the
+            // expected exit path, not an error. Logging it at error level
+            // pollutes monitoring (see #15844 for the production
+            // numbers). Bail out with a debug log before the upstream /
+            // generic error branches so we never emit an
+            // `error`-level entry for an AbortError.
+            if (isAbortError(error) && options?.abortSignal?.aborted) {
+              logger?.debug?.('LLM execution aborted', { runId });
+              await options?.onAbort?.({
+                steps: inputData?.output?.steps ?? [],
+              });
+
+              safeEnqueue(controller, { type: 'abort', runId, from: ChunkFrom.AGENT, payload: {} });
+
+              return { callBail: true, outputStream, runState, stepTools: currentStep.tools };
+            }
+
             const isUpstreamError = APICallError.isInstance(error);
 
             if (isUpstreamError) {
@@ -902,16 +1055,6 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
                 ...(provider && { provider }),
                 ...(modelIdStr && { modelId: modelIdStr }),
               });
-            }
-
-            if (isAbortError(error) && options?.abortSignal?.aborted) {
-              await options?.onAbort?.({
-                steps: inputData?.output?.steps ?? [],
-              });
-
-              safeEnqueue(controller, { type: 'abort', runId, from: ChunkFrom.AGENT, payload: {} });
-
-              return { callBail: true, outputStream, runState, stepTools: currentStep.tools };
             }
 
             if (isLastModel) {
@@ -1130,9 +1273,9 @@ export function createLLMExecutionStep<TOOLS extends ToolSet = ToolSet, OUTPUT =
         const messages = {
           all: messageList.get.all.aiV5.model(),
           user: messageList.get.input.aiV5.model(),
-          // Keep assistant messages out of the retry payload so agentic-execution/index.ts
-          // does not replay failed step output back into messageList. Error processors own
-          // any cleanup or replacement of assistant responses before the next attempt.
+          // Do not return failed assistant output as new response messages for this retry step.
+          // That output was already added to messageList while processing the failed stream;
+          // returning it in messages.nonUser would make agentic-execution/index.ts append it again.
           nonUser: [],
         };
 

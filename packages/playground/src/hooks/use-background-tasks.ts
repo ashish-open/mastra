@@ -3,8 +3,8 @@ import type { StreamBackgroundTasksParams } from '@mastra/client-js';
 import type { BackgroundTaskStatus } from '@mastra/core/background-tasks';
 import type { AgentChunkType } from '@mastra/core/stream';
 import { useMastraClient } from '@mastra/react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 export interface BackgroundTaskEvent {
   taskId: string;
@@ -16,6 +16,7 @@ export interface BackgroundTaskEvent {
   error?: { message: string; stack?: string };
   status: BackgroundTaskStatus;
   args: Record<string, unknown>;
+  suspendPayload?: unknown;
 }
 
 export interface UseBackgroundTaskStreamOptions extends StreamBackgroundTasksParams {
@@ -67,7 +68,9 @@ type EventType = Extract<
       | 'background-task-completed'
       | 'background-task-failed'
       | 'background-task-cancelled'
-      | 'background-task-output';
+      | 'background-task-output'
+      | 'background-task-suspended'
+      | 'background-task-resumed';
   }
 >;
 
@@ -77,6 +80,8 @@ const EVENT_STATUS_MAP: Record<EventType['type'], BackgroundTaskStatus> = {
   'background-task-completed': 'completed',
   'background-task-failed': 'failed',
   'background-task-cancelled': 'cancelled',
+  'background-task-suspended': 'suspended',
+  'background-task-resumed': 'running',
 };
 
 export function useBackgroundTaskStream(options: UseBackgroundTaskStreamOptions = {}): UseBackgroundTaskStreamReturn {
