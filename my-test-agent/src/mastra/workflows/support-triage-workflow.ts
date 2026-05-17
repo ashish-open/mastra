@@ -39,8 +39,12 @@ const triageStep = createStep({
     if (!agent) throw new Error('supportTriageAgent not found in Mastra config');
 
     const safetyClause = autoSendReply
-      ? 'You ARE authorized to post a public reply with reply-to-freshdesk-ticket if the answer is high-confidence and from the knowledge base.'
+      ? 'You ARE authorized to post a public reply with reply-to-freshdesk-ticket on this run.'
       : 'You are NOT authorized to post a public reply. Use add-freshdesk-private-note only.';
+
+    const replyStep = autoSendReply
+      ? '5. Post the draft as a PUBLIC reply using reply-to-freshdesk-ticket (this sends to the customer). Do NOT use add-freshdesk-private-note on this run.'
+      : '5. Post the draft as a PRIVATE NOTE (add-freshdesk-private-note) — formatted as instructed.';
 
     const prompt = `
 Triage Freshdesk ticket #${ticketId}.
@@ -52,15 +56,22 @@ Steps:
 2. Classify it.
 3. Call search-knowledge with a focused query from the ticket.
 4. Draft an L1 reply.
-5. Post the draft as a PRIVATE NOTE (add-freshdesk-private-note) — formatted as instructed.
+${replyStep}
 6. Tag the ticket with category:{classification} and "ai-triaged" via update-freshdesk-ticket.
 
 After you're done, respond with one short line:
 CLASSIFICATION=<category>
 `.trim();
 
+    // Resource-scope memory PER TICKET so re-runs on the same ticket build
+    // on prior triage context (working memory + history carry over).
     let agentText = '';
-    const stream = await agent.stream([{ role: 'user', content: prompt }]);
+    const stream = await agent.stream([{ role: 'user', content: prompt }], {
+      memory: {
+        resource: `freshdesk-ticket-${ticketId}`,
+        thread: `triage-${ticketId}`,
+      },
+    });
     for await (const chunk of stream.textStream) {
       agentText += chunk;
     }

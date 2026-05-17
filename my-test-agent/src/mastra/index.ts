@@ -5,24 +5,62 @@ import { PinoLogger } from '@mastra/loggers';
 import { LibSQLStore } from '@mastra/libsql';
 import { DuckDBStore } from '@mastra/duckdb';
 import { Observability, DefaultExporter, CloudExporter, SensitiveDataFilter } from '@mastra/observability';
-import { weatherWorkflow } from './workflows/weather-workflow';
 import { deployMeetingBotWorkflow, processMeetingWorkflow } from './workflows/meeting-workflow';
 import { supportTriageWorkflow } from './workflows/support-triage-workflow';
-import { weatherAgent } from './agents/weather-agent';
+import { reconcileWorkflow } from './reconciliation/workflow';
+// Ensure reco adapters + configs are registered at app startup
+import { ensureConfigsRegistered, RECO_CONFIGS_LOADED } from './reconciliation/configs';
+void RECO_CONFIGS_LOADED;
+ensureConfigsRegistered();
 import { zeusAgent } from './agents/zeus-agent';
 import { knowledgeAgent } from './agents/knowledge-agent';
 import { meetingAgent } from './agents/meeting-agent';
 import { supportTriageAgent } from './agents/support-triage-agent';
-import { toolCallAppropriatenessScorer, completenessScorer, translationScorer } from './scorers/weather-scorer';
+import { fuzzyMatchAgent, dispositionAgent } from './reconciliation/agents';
+import {
+  candidateValidityScorer,
+  dispositionAccuracyScorer,
+  reasoningQualityScorer,
+} from './reconciliation/evals/scorers';
 import { recallWebhookRoute } from './routes/recall-webhook';
 import { freshdeskWebhookRoute } from './routes/freshdesk-webhook';
+import { recoUploadRoute } from './routes/reco-upload';
+import {
+  integrationInfoRoute,
+  integrationRecoRunsRoute,
+  integrationRecoDecisionsRoute,
+} from './routes/integration';
 
 export const mastra = new Mastra({
-  workflows: { weatherWorkflow, deployMeetingBotWorkflow, processMeetingWorkflow, supportTriageWorkflow },
-  agents: { weatherAgent, zeusAgent, knowledgeAgent, meetingAgent, supportTriageAgent },
-  scorers: { toolCallAppropriatenessScorer, completenessScorer, translationScorer },
+  workflows: {
+    deployMeetingBotWorkflow,
+    processMeetingWorkflow,
+    supportTriageWorkflow,
+    reconcileWorkflow,
+  },
+  agents: {
+    zeusAgent,
+    knowledgeAgent,
+    meetingAgent,
+    supportTriageAgent,
+    fuzzyMatchAgent,
+    dispositionAgent,
+  },
+  scorers: {
+    candidateValidityScorer,
+    dispositionAccuracyScorer,
+    reasoningQualityScorer,
+  },
   server: {
-    apiRoutes: [recallWebhookRoute, freshdeskWebhookRoute],
+    apiRoutes: [
+      recallWebhookRoute,
+      freshdeskWebhookRoute,
+      recoUploadRoute,
+      // Integration surface — external apps (OpenArc, etc.) call these
+      integrationInfoRoute,
+      integrationRecoRunsRoute,
+      integrationRecoDecisionsRoute,
+    ],
   },
   storage: new MastraCompositeStore({
     id: 'composite-storage',

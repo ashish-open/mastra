@@ -1,5 +1,5 @@
 import { Agent } from '@mastra/core/agent';
-import { Memory } from '@mastra/memory';
+import { zeusMemory } from '../memory/memory-profiles';
 import { mandateCheckTool } from '../tools/mandate-check-tool';
 import { paymentTool } from '../tools/payment-tool';
 import { wibmoTransactTool } from '../tools/wibmo-transact-tool';
@@ -91,5 +91,5 @@ export const zeusAgent = new Agent({
     'wibmo-get-cryptogram': wibmoTransactTool,
     'submit-agentic-payment': paymentTool,
   },
-  memory: new Memory(),
+  memory: zeusMemory,
 });

@@ -5,6 +5,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "ingest": "node --env-file=.env --import tsx/esm src/mastra/knowledge/ingest.ts",
+    "eval:reco": "node --env-file=.env --import tsx/esm src/mastra/reconciliation/evals/run-eval.ts",
     "dev": "mastra dev",
     "build": "mastra build",
     "start": "mastra start"

@@ -1,9 +1,9 @@
 import { Agent } from '@mastra/core/agent';
 import { createTool } from '@mastra/core/tools';
 import { createClient } from '@libsql/client';
-import { Memory } from '@mastra/memory';
 import { z } from 'zod';
 import { embedOne } from '../knowledge/embed.js';
+import { knowledgeMemory } from '../memory/memory-profiles.js';
 
 const INDEX_NAME = 'knowledge';
 
@@ -144,5 +144,5 @@ export const knowledgeAgent = new Agent({
   tools: {
     'search-knowledge': searchKnowledge,
   },
-  memory: new Memory(),
+  memory: knowledgeMemory,
 });

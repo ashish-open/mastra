@@ -13,7 +13,7 @@
  */
 
 import { Agent } from '@mastra/core/agent';
-import { Memory } from '@mastra/memory';
+import { meetingMemory } from '../memory/memory-profiles.js';
 import { postToSlack } from '../tools/slack-tool.js';
 import { searchKnowledge } from './knowledge-agent.js';
 import { zwitchDocsTools } from '../tools/zwitch-mcp.js';
@@ -131,5 +131,5 @@ export const meetingAgent = new Agent({
     'search-knowledge': searchKnowledge,
     ...zwitchDocsTools,
   },
-  memory: new Memory(),
+  memory: meetingMemory,
 });

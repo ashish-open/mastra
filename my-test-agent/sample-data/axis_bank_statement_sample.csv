@@ -1,0 +1,4 @@
+date,amount,utr,description,counterparty,type
+2026-05-13,29149.50,AXISN20260513001,NEFT credit from Zwitch,ZWITCH SETTLEMENT,credit
+2026-05-13,50000.00,HDFC20260513999,NEFT credit from customer wire,Direct Customer,credit
+2026-05-13,1786.81,SWIG20260513001,NEFT credit from Swiggy,SWIGGY INDIA,credit

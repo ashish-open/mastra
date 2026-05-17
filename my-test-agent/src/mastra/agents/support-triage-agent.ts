@@ -17,7 +17,7 @@
  */
 
 import { Agent } from '@mastra/core/agent';
-import { Memory } from '@mastra/memory';
+import { supportTriageMemory } from '../memory/memory-profiles.js';
 import { searchKnowledge } from './knowledge-agent.js';
 import {
   getFreshdeskTicket,
@@ -92,6 +92,22 @@ export const supportTriageAgent = new Agent({
 
     ## Triage workflow — STRICT order
 
+    0. **Check working memory FIRST.** Your working memory has a "Triage History"
+       section that records prior runs on this ticket. Before doing anything:
+       - If "Latest classification" is empty / blank → this is a NEW triage,
+         proceed to step 1.
+       - If "Latest classification" is filled in (you already triaged this
+         ticket in a prior turn or run) → DO NOT call add-freshdesk-private-note
+         or update-freshdesk-ticket again. Instead, respond conversationally:
+         summarize what you already did (classification, confidence, draft
+         summary, tags applied), and ask the user whether they want you to:
+         (a) revise the existing draft (you'd post a NEW note marked "v2"),
+         (b) re-classify with different signals,
+         (c) just show the existing draft, or
+         (d) leave it alone.
+         Then STOP — do not proceed to step 1 unless the user confirms.
+       This prevents duplicate private notes on the same ticket.
+
     1. Call get-freshdesk-ticket. Note the **resolvedGroupId** and
        **resolvedGroupName** in the response — that's the canonical owner team
        per Freshdesk's mailbox config. This is your DEFAULT routing answer.
@@ -133,7 +149,9 @@ export const supportTriageAgent = new Agent({
          loop in our [team] team."
 
     7. Post the draft as a PRIVATE NOTE using add-freshdesk-private-note,
-       formatted EXACTLY as below:
+       formatted EXACTLY as below. If working memory shows this is a revision
+       (user explicitly asked for a re-draft), use header
+       "🤖 AI Triage Draft v2 — review before sending" instead.
 
        🤖 AI Triage Draft — review before sending
 
@@ -200,5 +218,5 @@ export const supportTriageAgent = new Agent({
     'search-knowledge': searchKnowledge,
     ...zwitchDocsTools,
   },
-  memory: new Memory(),
+  memory: supportTriageMemory,
 });

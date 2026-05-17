@@ -232,7 +232,7 @@ const generateAndPostSummaryStep = createStep({
     slackPosted: z.boolean(),
   }),
   execute: async ({ inputData, mastra }) => {
-    const { botId, meetingTitle, meetingType, plainText, speakerCount, wordCount, durationMinutes } = inputData;
+    const { transcriptId, botId, meetingTitle, meetingType, plainText, speakerCount, wordCount, durationMinutes } = inputData;
 
     const agent = mastra?.getAgent('meetingAgent');
     if (!agent) throw new Error('meeting-agent not found in Mastra config');
@@ -282,8 +282,15 @@ Steps (do them in order):
    - fields: [{ label: "Duration", value: "${durationMinutes ? durationMinutes + ' min' : 'unknown'}" }, { label: "Speakers", value: "${speakerCount}" }, { label: "Type", value: "${meetingType}" }]
 `;
 
+    // Resource-scope memory PER MEETING (botId) so a re-run on the same
+    // meeting carries over the working-memory notes built up the first time.
     let summaryText = '';
-    const response = await agent.stream([{ role: 'user', content: prompt }]);
+    const response = await agent.stream([{ role: 'user', content: prompt }], {
+      memory: {
+        resource: `meeting-${botId}`,
+        thread: `process-${transcriptId}`,
+      },
+    });
     for await (const chunk of response.textStream) {
       summaryText += chunk;
     }
