@@ -6,9 +6,18 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "ingest": "node --env-file=.env --import tsx/esm src/mastra/knowledge/ingest.ts",
     "eval:reco": "node --env-file=.env --import tsx/esm src/mastra/reconciliation/evals/run-eval.ts",
+    "eval:reco:exp": "node --env-file=.env --import tsx/esm src/mastra/reconciliation/evals/run-experiment.ts",
+    "eval:triage:exp": "node --env-file=.env --import tsx/esm src/mastra/support-triage-evals/run-experiment.ts",
+    "eval:knowledge:exp": "node --env-file=.env --import tsx/esm src/mastra/knowledge-evals/run-experiment.ts",
+    "eval:meeting:exp": "node --env-file=.env --import tsx/esm src/mastra/meeting-evals/run-experiment.ts",
+    "eval:zeus:exp": "node --env-file=.env --import tsx/esm src/mastra/zeus-evals/run-experiment.ts",
+    "eval:all": "pnpm eval:reco:exp && pnpm eval:triage:exp && pnpm eval:knowledge:exp && pnpm eval:meeting:exp && pnpm eval:zeus:exp",
+    "predev": "bash scripts/kill-zombie-mastra.sh",
     "dev": "mastra dev",
+    "prestart": "bash scripts/kill-zombie-mastra.sh",
     "build": "mastra build",
-    "start": "mastra start"
+    "start": "mastra start",
+    "kill-zombies": "bash scripts/kill-zombie-mastra.sh"
   },
   "keywords": [],
   "author": "",
@@ -28,8 +37,11 @@
     "@mastra/memory": "^1.17.1",
     "@mastra/observability": "^1.10.0",
     "@mastra/rag": "^2.2.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@types/pg": "^8.18.0",
     "node-fetch": "^3.3.2",
     "ollama": "^0.6.3",
+    "pg": "^8.20.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {

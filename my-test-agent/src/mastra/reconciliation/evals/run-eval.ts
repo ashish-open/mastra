@@ -39,9 +39,27 @@ import {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/** Format paise → "₹1,46,233.00" (Indian numbering). Mirrors workflow.ts. */
+function formatRupees(paise: number | undefined | null): string {
+  if (paise === null || paise === undefined || Number.isNaN(paise)) return '—';
+  const sign = paise < 0 ? '-' : '';
+  const rupees = Math.abs(paise) / 100;
+  return `${sign}₹${rupees.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/** Mirror of workflow.ts `txnForLlm` — ensures the eval exercises the same
+ *  prompt shape as production. Adds `displayAmount` so the LLM never has to
+ *  divide paise by 100 to express a rupee value. */
+function txnForLlm<T extends { amountPaise?: number } | null | undefined>(t: T): T extends null | undefined ? null : T & { displayAmount: string } {
+  if (!t) return null as never;
+  return { ...t, displayAmount: formatRupees(t.amountPaise ?? 0) } as never;
+}
+
 interface CaseResult {
   name: string;
   category: Category;
+  /** Pulled from the eval case so we can pivot the matrix. */
+  configId?: string;
   passed: boolean;
   detail: string;
   reasoningScore?: number;
@@ -103,10 +121,12 @@ async function runFuzzyEval(): Promise<{
   const triplets: Triplet[] = await mapWithConcurrency(FUZZY_CASES, 6, async c => {
     const prompt = [
       'Unmatched transaction:',
-      JSON.stringify(c.input.unmatched, null, 2),
+      JSON.stringify(txnForLlm(c.input.unmatched), null, 2),
       '',
       'Candidate pool (transactions from OTHER sources):',
-      JSON.stringify(c.input.candidatePool, null, 2),
+      JSON.stringify(c.input.candidatePool.map(txnForLlm), null, 2),
+      '',
+      'When writing rupee figures in your reasoning, ALWAYS quote the `displayAmount` field. NEVER cite `amountPaise` directly as a rupee value (it is in paise, where 100 paise = ₹1).',
       '',
       'Pick the best candidate (or null if none plausible).',
     ].join('\n');
@@ -145,7 +165,7 @@ async function runFuzzyEval(): Promise<{
 
     const vPass = vRes.score === 1;
     const validity: CaseResult = {
-      name: c.name, category: c.category, passed: vPass,
+      name: c.name, category: c.category, configId: c.configId, passed: vPass,
       detail: vPass ? 'ok' : `picked '${out.bestCandidate?.candidateTxnId}' not in pool`,
     };
 
@@ -158,7 +178,7 @@ async function runFuzzyEval(): Promise<{
       if (c.expected.maxScore !== undefined && s > c.expected.maxScore) pickPass = false;
     }
     const pick: CaseResult = {
-      name: c.name, category: c.category, passed: pickPass,
+      name: c.name, category: c.category, configId: c.configId, passed: pickPass,
       detail: pickPass
         ? `${actual ?? 'null'} ✓`
         : expected === actual
@@ -167,7 +187,7 @@ async function runFuzzyEval(): Promise<{
     };
 
     const reasoning: CaseResult = {
-      name: c.name, category: c.category, passed: rScore >= 0.5,
+      name: c.name, category: c.category, configId: c.configId, passed: rScore >= 0.5,
       detail: `score=${rScore}`,
       reasoningScore: rScore,
     };
@@ -215,10 +235,12 @@ async function runDispositionEval(): Promise<{ dispositionAccuracy: CaseResult[]
       `Today is ${evalToday.toISOString().slice(0, 10)}. daysOld = ${daysOld}.`,
       '',
       'Unmatched source transaction:',
-      JSON.stringify(c.input.sourceTxn, null, 2),
+      JSON.stringify(txnForLlm(c.input.sourceTxn), null, 2),
       '',
       'Fuzzy match result:',
       JSON.stringify(c.input.fuzzyResult, null, 2),
+      '',
+      'When writing rupee figures in `reasoning` or `reviewerExplanation`, ALWAYS quote the `displayAmount` field. NEVER cite `amountPaise` directly as a rupee value (it is in paise, where 100 paise = ₹1).',
       '',
       'Decide the disposition by walking the matrix top-to-bottom and stopping at the first rule that fires.',
     ].join('\n');
@@ -230,7 +252,7 @@ async function runDispositionEval(): Promise<{ dispositionAccuracy: CaseResult[]
       out = (r as unknown as { object: Disposition }).object;
     } catch (err) {
       const msg = (err as Error).message;
-      return { name: c.name, category: c.category, passed: false, detail: `agent error: ${msg}` } as CaseResult;
+      return { name: c.name, category: c.category, configId: c.configId, passed: false, detail: `agent error: ${msg}` } as CaseResult;
     }
 
     const dRes = await dispositionAccuracyScorer.run({
@@ -239,7 +261,7 @@ async function runDispositionEval(): Promise<{ dispositionAccuracy: CaseResult[]
     });
     const passed = dRes.score === 1;
     return {
-      name: c.name, category: c.category, passed,
+      name: c.name, category: c.category, configId: c.configId, passed,
       detail: passed ? `${out.recommendation} ✓` : `expected ${c.expected.recommendation}, got ${out.recommendation}`,
     } as CaseResult;
   });
@@ -295,13 +317,186 @@ function printReport(allResults: {
   console.log('');
 }
 
+// ─── Per-config × per-category scoreboard (Plan B#5) ─────────────────────────
+
+/**
+ * Pivots `bestCandidatePick` + `dispositionAccuracy` results into a matrix
+ * with configId as rows and category as columns. Cells are pass-rate strings.
+ *
+ * Cases without a configId are bucketed as 'common'. Empty cells show '·'.
+ */
+function printConfigMatrix(results: CaseResult[]) {
+  // Group counts: configId → category → { passed, total }
+  type Counts = Map<string, Map<Category, { passed: number; total: number }>>;
+  const grid: Counts = new Map();
+  for (const r of results) {
+    const cfg = r.configId ?? 'common';
+    if (!grid.has(cfg)) grid.set(cfg, new Map());
+    const row = grid.get(cfg)!;
+    const cell = row.get(r.category) ?? { passed: 0, total: 0 };
+    cell.total += 1;
+    if (r.passed) cell.passed += 1;
+    row.set(r.category, cell);
+  }
+  const configs = [...grid.keys()].sort();
+  // Only print categories that have at least one cell populated.
+  const usedCats = CATEGORIES.filter(cat =>
+    configs.some(cfg => (grid.get(cfg)?.get(cat)?.total ?? 0) > 0),
+  );
+
+  console.log(`\n${'='.repeat(78)}`);
+  console.log('  BY CONFIG × CATEGORY  (pick + disposition combined)');
+  console.log('='.repeat(78));
+
+  const colWidth = 14;
+  const firstCol = 24;
+  const header = 'config'.padEnd(firstCol) + usedCats.map(c => c.padEnd(colWidth)).join('');
+  console.log('  ' + header);
+  console.log('  ' + '-'.repeat(header.length));
+
+  for (const cfg of configs) {
+    const row = grid.get(cfg)!;
+    const cells = usedCats.map(cat => {
+      const cell = row.get(cat);
+      if (!cell || cell.total === 0) return '·'.padEnd(colWidth);
+      return `${Math.round((cell.passed / cell.total) * 100)}% (${cell.passed}/${cell.total})`.padEnd(colWidth);
+    });
+    console.log('  ' + cfg.padEnd(firstCol) + cells.join(''));
+  }
+  console.log('');
+}
+
+// ─── Snapshot persistence + regression detection (Plan B#5) ──────────────────
+
+interface RunSnapshot {
+  timestamp: string;
+  matcherVersion: string;
+  totals: {
+    candidateValidity: { passed: number; total: number };
+    bestCandidatePick: { passed: number; total: number };
+    reasoningAvg: number;
+    dispositionAccuracy: { passed: number; total: number };
+  };
+  byConfig: Record<string, Record<string, { passed: number; total: number }>>;
+}
+
+const RESULTS_DIR = new URL('./results/', import.meta.url);
+
+async function saveSnapshot(snap: RunSnapshot): Promise<string> {
+  const fs = await import('node:fs/promises');
+  await fs.mkdir(RESULTS_DIR, { recursive: true });
+  const safeStamp = snap.timestamp.replace(/[:.]/g, '-');
+  const file = new URL(`${safeStamp}.json`, RESULTS_DIR);
+  await fs.writeFile(file, JSON.stringify(snap, null, 2));
+  return file.pathname;
+}
+
+async function loadLatestPrior(currentStamp: string): Promise<RunSnapshot | null> {
+  const fs = await import('node:fs/promises');
+  let files: string[];
+  try {
+    files = await fs.readdir(RESULTS_DIR);
+  } catch {
+    return null;
+  }
+  const safeCurrent = currentStamp.replace(/[:.]/g, '-');
+  const prior = files
+    .filter(f => f.endsWith('.json') && !f.startsWith(safeCurrent))
+    .sort()
+    .pop();
+  if (!prior) return null;
+  const raw = await fs.readFile(new URL(prior, RESULTS_DIR), 'utf8');
+  return JSON.parse(raw) as RunSnapshot;
+}
+
+function buildSnapshot(allResults: {
+  candidateValidity: CaseResult[];
+  bestCandidatePick: CaseResult[];
+  reasoning: CaseResult[];
+  dispositionAccuracy: CaseResult[];
+}): RunSnapshot {
+  const { candidateValidity, bestCandidatePick, reasoning, dispositionAccuracy } = allResults;
+  const sum = (rs: CaseResult[]) => ({
+    passed: rs.filter(r => r.passed).length,
+    total: rs.length,
+  });
+  // Combine pick + disposition for the per-config grid (same as printed table).
+  const byConfig: Record<string, Record<string, { passed: number; total: number }>> = {};
+  for (const r of [...bestCandidatePick, ...dispositionAccuracy]) {
+    const cfg = r.configId ?? 'common';
+    byConfig[cfg] = byConfig[cfg] ?? {};
+    const cell = byConfig[cfg][r.category] ?? { passed: 0, total: 0 };
+    cell.total += 1;
+    if (r.passed) cell.passed += 1;
+    byConfig[cfg][r.category] = cell;
+  }
+  return {
+    timestamp: new Date().toISOString(),
+    matcherVersion: 'v2.1.0',
+    totals: {
+      candidateValidity: sum(candidateValidity),
+      bestCandidatePick: sum(bestCandidatePick),
+      reasoningAvg:
+        reasoning.reduce((a, b) => a + (b.reasoningScore ?? 0), 0) /
+        Math.max(1, reasoning.length),
+      dispositionAccuracy: sum(dispositionAccuracy),
+    },
+    byConfig,
+  };
+}
+
+function diffSnapshots(prior: RunSnapshot, current: RunSnapshot): {
+  improved: string[];
+  regressed: string[];
+} {
+  const improved: string[] = [];
+  const regressed: string[] = [];
+  const fmt = (n: number) => `${(n * 100).toFixed(0)}%`;
+  // Compare totals
+  const pairs: Array<[string, { passed: number; total: number }, { passed: number; total: number }]> = [
+    ['candidate-validity', prior.totals.candidateValidity, current.totals.candidateValidity],
+    ['best-candidate-pick', prior.totals.bestCandidatePick, current.totals.bestCandidatePick],
+    ['disposition-accuracy', prior.totals.dispositionAccuracy, current.totals.dispositionAccuracy],
+  ];
+  for (const [label, p, c] of pairs) {
+    const before = p.total === 0 ? 0 : p.passed / p.total;
+    const after = c.total === 0 ? 0 : c.passed / c.total;
+    if (after > before + 0.02) improved.push(`${label}: ${fmt(before)} → ${fmt(after)}`);
+    if (after < before - 0.02) regressed.push(`${label}: ${fmt(before)} → ${fmt(after)}`);
+  }
+  return { improved, regressed };
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
   const t0 = Date.now();
   // Two evals are independent → run them in parallel
   const [fuzzy, disp] = await Promise.all([runFuzzyEval(), runDispositionEval()]);
-  printReport({ ...fuzzy, ...disp });
+  const all = { ...fuzzy, ...disp };
+  printReport(all);
+
+  // Plan B#5: per-config × per-category matrix
+  printConfigMatrix([...all.bestCandidatePick, ...all.dispositionAccuracy]);
+
+  // Plan B#5: snapshot + regression detection
+  const snap = buildSnapshot(all);
+  const prior = await loadLatestPrior(snap.timestamp);
+  const snapPath = await saveSnapshot(snap);
+  console.log(`Snapshot: ${snapPath}`);
+  if (prior) {
+    const { improved, regressed } = diffSnapshots(prior, snap);
+    if (improved.length || regressed.length) {
+      console.log(`\nVs prior run (${prior.timestamp}):`);
+      for (const m of improved) console.log(`  ↑ ${m}`);
+      for (const m of regressed) console.log(`  ↓ ${m}`);
+    } else {
+      console.log(`Vs prior run (${prior.timestamp}): no significant change (±2%).`);
+    }
+  } else {
+    console.log('No prior snapshot — this run becomes the baseline.');
+  }
+
   console.log(`\nTotal time: ${((Date.now() - t0) / 1000).toFixed(1)}s\n`);
 }
 

@@ -1,17 +1,23 @@
 /**
- * Persistence + run-tracking helpers for the reconciliation workflow.
+ * Persistence helpers used by the reconciliation workflow and routes.
  *
- * These delegate to `db.ts` (LibSQL-backed). The function names are kept
- * stable for the workflow that imports them. The old in-memory Maps were
- * replaced because they were wiped on every `pnpm dev` restart, causing
- * OpenArc to see "no decisions" for any run that predated the restart.
+ * Two concerns sit here:
+ *   - Run lifecycle + decision audit log (delegates to db.ts)
+ *   - Staged-transactions CRUD: uploaded statements live here until a run consumes them
  *
- * Workflow side imports these directly. Read-side (integration routes)
- * import the dbList* functions from db.ts.
+ * The function names are deliberately kept stable for the workflow imports.
  */
 
-import type { RecoDecision } from './types.js';
-import { dbOpenRecoRun, dbWriteRecoDecisions } from './db.js';
+import type { NormalizedTxn, RecoDecision } from './types.js';
+import {
+  dbOpenRecoRun,
+  dbWriteRecoDecisions,
+  dbStageTransactions,
+  dbGetStagedTransactions,
+  dbListStagedSources,
+  dbDeleteStagedSlot,
+  type StagedSourceSummary,
+} from './db.js';
 
 export async function openRecoRun(args: {
   date: string;
@@ -24,8 +30,55 @@ export async function openRecoRun(args: {
 export async function writeRecoDecisions(args: {
   runId: string;
   decisions: RecoDecision[];
+  /** Default true. Set false when staging pending decisions before a
+   *  suspend() — the run isn't actually done yet. */
+  markCompleted?: boolean;
 }): Promise<{ runId: string; written: number }> {
   const result = await dbWriteRecoDecisions(args);
-  console.log(`[reco] Wrote ${result.written} decisions for run ${args.runId}`);
+  const stateNote = args.markCompleted === false ? ' (staged, run still open)' : '';
+  console.log(`[reco] Wrote ${result.written} decisions for run ${args.runId}${stateNote}`);
   return result;
 }
+
+// ─── Staging helpers (used by /reco/upload + workflow source-fetch) ─────────
+
+export async function stageTransactions(args: {
+  configId: string;
+  adapterId: string;
+  date: string;
+  txns: NormalizedTxn[];
+  filename?: string;
+  uploadedBy?: string;
+}): Promise<{ count: number; replaced: number }> {
+  const r = await dbStageTransactions(args);
+  console.log(
+    `[reco] Staged ${r.count} txns for config=${args.configId} adapter=${args.adapterId} ` +
+    `date=${args.date} (replaced ${r.replaced} prior)`
+  );
+  return r;
+}
+
+export async function getStagedTransactions(
+  configId: string,
+  adapterId: string,
+  date: string,
+): Promise<NormalizedTxn[]> {
+  return dbGetStagedTransactions(configId, adapterId, date);
+}
+
+export async function listStagedSources(
+  configId: string,
+  date: string,
+): Promise<StagedSourceSummary[]> {
+  return dbListStagedSources(configId, date);
+}
+
+export async function clearStagedSlot(
+  configId: string,
+  adapterId: string,
+  date: string,
+): Promise<{ deleted: number }> {
+  return dbDeleteStagedSlot(configId, adapterId, date);
+}
+
+export type { StagedSourceSummary };

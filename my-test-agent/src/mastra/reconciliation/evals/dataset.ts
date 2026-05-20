@@ -40,6 +40,13 @@ export type Category = typeof CATEGORIES[number];
 export interface FuzzyEvalCase {
   name: string;
   category: Category;
+  /**
+   * Optional config tag — pins the case to a specific ReconcileConfig so the
+   * B#5 scoreboard can detect "this prompt change improved bank-pg-razorpay
+   * but broke restaurant-swiggy". Leave undefined to tag a case as 'common'
+   * (config-agnostic).
+   */
+  configId?: string;
   notes?: string;
   input: {
     unmatched: NormalizedTxn;
@@ -219,6 +226,8 @@ export const FUZZY_CASES: FuzzyEvalCase[] = [
 export interface DispositionEvalCase {
   name: string;
   category: Category;
+  /** Same semantics as FuzzyEvalCase.configId — see comment there. */
+  configId?: string;
   notes?: string;
   input: {
     fuzzyResult: FuzzyMatchResult;

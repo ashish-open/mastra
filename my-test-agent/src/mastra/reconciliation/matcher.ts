@@ -10,7 +10,19 @@
 import type { MatchStrategy, ReconcileConfig } from './adapter.js';
 import type { NormalizedTxn, RecoDecision } from './types.js';
 
-const MATCHER_VERSION = 'v2.0.0';  // bump on any matcher-logic change
+// v2.1.0: split former blanket `exact` matchType into three customer-readable
+//         buckets — `exact` (1:1 amount-equal), `tolerance_match`
+//         (1:1 with commission/fee delta) and `batch_match` (N:1 settlement).
+//         Structured `metadata` now carries batch id / batch size / expected
+//         amount so the UI can render details without parsing reasoning strings.
+const MATCHER_VERSION = 'v2.1.0';
+
+/** Format paise as a customer-readable INR string (₹1,23,456.78). */
+function formatRupees(paise: number): string {
+  const sign = paise < 0 ? '-' : '';
+  const rupees = Math.abs(paise) / 100;
+  return `${sign}₹${rupees.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
 
 interface FetchedSource {
   adapterId: string;
@@ -115,7 +127,8 @@ function matchExact(
       amountDeltaPaise: 0,
       decidedBy: 'system',
       matcherVersion: MATCHER_VERSION,
-      reasoning: `exact: ${strategy.name} (joinKey=${strategy.joinKey})`,
+      reasoning: `Reference ${strategy.joinKey.toUpperCase()} and amount match exactly.`,
+      metadata: { strategyName: strategy.name },
     });
     rightByKey.delete(k);
   }
@@ -153,14 +166,25 @@ function matchAmountTolerance(
     const delta = Math.abs(expected - r.amountPaise);
     if (delta > tol) { unmatchedLeft.push(l); continue; }
 
+    const reasoning = strategy.expectedNetPaise
+      ? `Bank credit matches gross ${formatRupees(l.amountPaise)} minus expected fee/commission ` +
+        `(expected ${formatRupees(expected)}, received ${formatRupees(r.amountPaise)}, ` +
+        `delta ${formatRupees(delta)} within tolerance ${formatRupees(tol)}).`
+      : `Bank credit matches with ${formatRupees(delta)} delta (within ${formatRupees(tol)} tolerance).`;
+
     decisions.push({
       sourceTxnId: l.sourceId,
       targetTxnId: r.sourceId,
-      matchType: 'exact',
+      matchType: 'tolerance_match',
       amountDeltaPaise: delta,
       decidedBy: 'system',
       matcherVersion: MATCHER_VERSION,
-      reasoning: `amount_tolerance: ${strategy.name} (delta=${delta}p, tol=${tol}p)`,
+      reasoning,
+      metadata: {
+        strategyName: strategy.name,
+        expectedPaise: expected,
+        tolerancePaise: tol,
+      },
     });
     rightByKey.delete(k);
   }
@@ -209,16 +233,29 @@ function matchSumThenMatch(
     if (!r) continue;
     if (Math.abs(r.amountPaise - sumPaise) > tol) continue;
 
-    // Emit one decision per LEFT row in the group, all pointing to the same RIGHT
+    // Emit one decision per LEFT row in the group, all pointing to the same RIGHT.
+    // Every row in the batch shares the same customer-readable reasoning + metadata
+    // so the UI can group/expand the batch on the front end.
+    const reasoning =
+      `Batched settlement: ${group.length} transactions totalling ` +
+      `${formatRupees(sumPaise)} settled together as one bank credit ` +
+      `(batch ${groupKey}).`;
+    const metadata = {
+      strategyName: strategy.name,
+      batchId: groupKey,
+      batchSize: group.length,
+      batchSumPaise: sumPaise,
+    };
     for (const l of group) {
       decisions.push({
         sourceTxnId: l.sourceId,
         targetTxnId: r.sourceId,
-        matchType: 'exact',
+        matchType: 'batch_match',
         amountDeltaPaise: 0,
         decidedBy: 'system',
         matcherVersion: MATCHER_VERSION,
-        reasoning: `sum_then_match: ${strategy.name} (batch=${groupKey}, sum=${sumPaise}p)`,
+        reasoning,
+        metadata,
       });
       matchedLeftIds.add(l.sourceId);
     }

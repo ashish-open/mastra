@@ -21,6 +21,10 @@ const CHANNEL_MAP: Record<string, string> = {
   onboarding: 'SLACK_WEBHOOK_ONBOARDING',
   ops: 'SLACK_WEBHOOK_OPS',
   support: 'SLACK_WEBHOOK_SUPPORT',
+  finance: 'SLACK_WEBHOOK_FINANCE',
+  product: 'SLACK_WEBHOOK_PRODUCT',
+  engineering: 'SLACK_WEBHOOK_ENGINEERING',
+  hr: 'SLACK_WEBHOOK_HR',
   general: 'SLACK_WEBHOOK_URL',
   default: 'SLACK_WEBHOOK_URL',
 };
@@ -36,7 +40,7 @@ export const postToSlack = createTool({
     'Posts a formatted message to a Slack channel. Use this to send meeting summaries, action items, or alerts.',
   inputSchema: z.object({
     channel: z
-      .enum(['sales', 'onboarding', 'ops', 'support', 'general', 'default'])
+      .enum(['sales', 'onboarding', 'ops', 'support', 'finance', 'product', 'engineering', 'hr', 'general', 'default'])
       .default('default')
       .describe('Which team channel to post to'),
     title: z.string().describe('Bold title shown at the top of the message'),

@@ -31,13 +31,17 @@ const CandidateValidityOutput = z.object({
   bestCandidate: z.object({ candidateTxnId: z.string() }).nullable(),
 });
 
-const DispositionInput = z.object({
-  expectedRecommendation: z.enum(['auto_match', 'human_review', 'write_off', 'flag_fraud']),
-});
+// Disposition agent receives a fuzzy result + source txn as input. The
+// EXPECTED recommendation lives on the dataset item's `groundTruth`, not on
+// `input` — see the read below.
+const DispositionInput = z.object({}).passthrough();
 const DispositionOutput = z.object({
   recommendation: z.enum(['auto_match', 'human_review', 'write_off', 'flag_fraud']),
   reasoning: z.string().optional(),
 });
+interface DispositionGroundTruth {
+  recommendation: 'auto_match' | 'human_review' | 'write_off' | 'flag_fraud';
+}
 
 const ReasoningInput = z.object({
   unmatchedTxn: z.unknown(),
@@ -77,7 +81,9 @@ export const dispositionAccuracyScorer = createScorer({
     output: DispositionOutput,
   },
 }).generateScore(({ run }) => {
-  return run.output.recommendation === run.input?.expectedRecommendation ? 1 : 0;
+  // groundTruth is typed `any` on ScorerRun — see Mastra evals/base.d.ts.
+  const gt = run.groundTruth as DispositionGroundTruth | undefined;
+  return run.output.recommendation === gt?.recommendation ? 1 : 0;
 });
 
 // ─── 3. Reasoning quality (LLM-judged) ───────────────────────────────────────

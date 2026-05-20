@@ -39,6 +39,15 @@ export const fuzzyMatchAgent = new Agent({
     - reasoning must be 1–2 sentences. State amount delta and counterparty similarity explicitly.
     - NEVER invent candidate IDs not in the input list.
     - If NO candidate has score >= 0.5, return bestCandidate: null.
+
+    ## Currency formatting (IMPORTANT)
+
+    Every transaction object includes a pre-formatted \`displayAmount\` field
+    (e.g. "₹1,462.33"). The \`amountPaise\` field is in PAISE — 100 paise = ₹1.
+    When quoting rupee figures in your reasoning, ALWAYS use \`displayAmount\`
+    or convert paise to rupees yourself. NEVER write \`amountPaise\` directly
+    as a rupee value — that produces 100× wrong figures (e.g. "₹1,46,233"
+    instead of "₹1,462.33").
   `,
   model: 'openai/gpt-4o-mini',
 });
@@ -96,7 +105,11 @@ export const dispositionAgent = new Agent({
 
     ## Output rules
 
-    - Reasoning MUST cite the specific signal(s) and which rule fired.
+    You output TWO reasoning fields:
+
+    ### \`reasoning\` (audit / engineering)
+    - MUST cite the specific signal(s) and which rule fired.
+    - Engineer-facing; goes into logs and the audit table.
       Examples:
         "amount ₹1,00,000 is round + counterparty 'UNKNOWN' is generic +
          UTR 'XXX000000' is malformed → 3 fraud signals → flag_fraud"
@@ -105,8 +118,50 @@ export const dispositionAgent = new Agent({
          → human_review (default)"
         "daysOld=60, amount ₹250 < ₹1000, no fraud signals → write_off"
     - Never write generic reasoning ("looks suspicious", "matches well").
+
+    ### \`reviewerExplanation\` (finance ops reviewer)
+    - One short sentence (under 25 words) in plain English, addressed to a
+      finance ops user who has NEVER read this prompt.
+    - Describe what the AI saw and what the reviewer should verify.
+    - NO jargon: avoid "similarityScore", "bestCandidate", "daysOld",
+      "fraud signals", "matrix", "rule". Translate.
+    - Mention concrete facts: amounts (in ₹), dates, counterparty names.
+    - Required when recommendation='human_review'. For other recommendations
+      it can be empty (UI doesn't surface it) — but a short note still helps
+      audit trails.
+      Examples:
+        human_review:
+          "Amount matches within ₹0.50, but the dates are 9 days apart —
+           please confirm this PG payment really maps to the May 12 bank credit."
+          "Refund of ₹2,000 — couldn't find a matching outflow on the bank
+           side. Confirm whether the refund has actually settled yet."
+          "No bank credit found for this ₹50,000 wire from Acme Corp. If you
+           expect it to clear, leave for the next reco; if not, reject."
+        flag_fraud:
+          "Round ₹1,00,000 from an unknown counterparty with a malformed UTR —
+           treat as suspicious."
+        write_off:
+          "Small (₹250), older than 30 days, no candidate found — safe to write off."
+    - Speak TO the reviewer in second person where natural ("please verify",
+      "you may want to").
+
+    ## General rules
+
     - When the matrix is ambiguous, prefer human_review. Auto-resolving
       wrong is far worse than asking a human.
+
+    ## Currency formatting (IMPORTANT)
+
+    Every transaction object includes a pre-formatted \`displayAmount\` field
+    (e.g. "₹1,462.33"). The \`amountPaise\` field is in PAISE — 100 paise = ₹1.
+    When quoting rupee figures in your reasoning or reviewerExplanation,
+    ALWAYS use \`displayAmount\` or convert paise to rupees yourself. NEVER
+    write \`amountPaise\` directly as a rupee value — that produces 100×
+    wrong figures (e.g. "₹1,46,233" instead of "₹1,462.33").
+
+    The \`paise % 100000\` round-number check for fraud signal (a) still
+    operates on \`amountPaise\` — that's correct. Only narration must use
+    rupees.
   `,
   model: 'openai/gpt-4o-mini',
 });

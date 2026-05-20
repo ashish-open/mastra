@@ -19,6 +19,7 @@
 import type { ApiRoute } from '@mastra/core/server';
 import { listConfigs } from '../reconciliation/adapter.js';
 import { dbListRecoRuns, dbListRecoDecisions } from '../reconciliation/db.js';
+import { MATCH_TYPE_LABELS } from '../reconciliation/types.js';
 import '../reconciliation/configs.js';
 
 function checkToken(c: { req: { header: (k: string) => string | undefined } }):
@@ -98,6 +99,10 @@ export const integrationInfoRoute: ApiRoute = {
         configs: recoConfigs,
         listRunsEndpoint: 'GET /integration/reco/runs',
         listDecisionsEndpoint: 'GET /integration/reco/runs/:runId/decisions',
+        // Customer-facing label + tone + description per match type. OpenArc
+        // (and any future UI) renders badges from this map, so adding a new
+        // match type doesn't require a UI release.
+        matchTypeLabels: MATCH_TYPE_LABELS,
       },
       authRequired: !!process.env.MASTRA_INTEGRATION_TOKEN,
     });
