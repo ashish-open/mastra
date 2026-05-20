@@ -378,9 +378,10 @@ export class ModelSpanTracker {
    * This should be called at the beginning of LLM execution to capture accurate startTime.
    * The step-start chunk payload can be passed later via updateStep() if needed.
    *
-   * Also opens a MODEL_INFERENCE child span that wraps the provider call. Chunks
-   * parent under MODEL_INFERENCE so processors/tool executions (which use the
-   * step span as their parent) remain siblings of the inference.
+   * Note: this only opens MODEL_STEP. The MODEL_INFERENCE child span is opened
+   * separately via startInference() so its duration excludes input processor work.
+   * Callers that don't call startInference() explicitly will get one auto-created
+   * when the first model chunk arrives.
    */
   startStep(payload?: StepStartPayload): void {
     // Don't create duplicate step spans
@@ -398,12 +399,11 @@ export class ModelSpanTracker {
         ...(payload?.warnings?.length ? { warnings: payload.warnings } : {}),
       },
       input,
+      tracingPolicy: this.#modelSpan?.tracingPolicy,
     });
     this.#currentStepInputIsFinal = Array.isArray(payload?.inputMessages);
     // Reset chunk sequence for new step
     this.#chunkSequence = 0;
-
-    this.#startInferenceSpan(input);
   }
 
   /**
@@ -437,11 +437,17 @@ export class ModelSpanTracker {
    * chunks emitted by the model) parent under this span so its duration reflects
    * pure model latency.
    *
+   * Should be called immediately before invoking the model — after any input
+   * processors / `prepareStep` work has completed — so the span's startTime
+   * does not include processor time. The latest `#inferenceContext` (set via
+   * setInferenceContext) is snapshotted onto the span at creation.
+   *
    * No-ops when the installed @mastra/core lacks the `model-inference-span`
-   * feature flag. Chunks then fall back to parenting under MODEL_STEP via
-   * #chunkParent(), preserving the pre-MODEL_INFERENCE hierarchy.
+   * feature flag, or when called without an active step span. Auto-invoked from
+   * chunk handlers as a safety net; explicit callers get the most accurate
+   * start time.
    */
-  #startInferenceSpan(input: StepInputPreview): void {
+  startInference(payload?: StepStartPayload): void {
     if (!supportsModelInference()) {
       return;
     }
@@ -449,6 +455,7 @@ export class ModelSpanTracker {
       return;
     }
 
+    const input = extractStepInput(payload);
     const generationAttrs = this.#modelSpan?.attributes;
     const ctx = this.#inferenceContext;
     this.#currentInferenceSpan = this.#currentStepSpan.createChildSpan({
@@ -466,6 +473,7 @@ export class ModelSpanTracker {
         ...(ctx?.responseFormat !== undefined ? { responseFormat: ctx.responseFormat } : {}),
       },
       input,
+      tracingPolicy: this.#modelSpan?.tracingPolicy,
     });
   }
 
@@ -556,6 +564,22 @@ export class ModelSpanTracker {
   }
 
   /**
+   * Safety-net invoked from chunk handlers: auto-create MODEL_STEP and
+   * MODEL_INFERENCE if a chunk arrives before the loop has explicitly opened
+   * them, so chunks parent under MODEL_INFERENCE rather than falling through
+   * to MODEL_STEP. Idempotent — each public start* method is itself a no-op
+   * when its span is already live.
+   */
+  #ensureStepAndInference(): void {
+    if (!this.#currentStepSpan) {
+      this.startStep();
+    }
+    if (!this.#currentInferenceSpan) {
+      this.startInference();
+    }
+  }
+
+  /**
    * Create a new chunk span (for multi-part chunks like text-start/delta/end)
    */
   #startChunkSpan(chunkType: string, initialData?: Record<string, any>) {
@@ -563,10 +587,7 @@ export class ModelSpanTracker {
     // (handles transitions like text-delta → tool-call without text-end)
     this.#endChunkSpan();
 
-    // Auto-create step if we see a chunk before step-start
-    if (!this.#currentStepSpan) {
-      this.startStep();
-    }
+    this.#ensureStepAndInference();
 
     this.#currentChunkSpan = this.#chunkParent()?.createChildSpan({
       name: `chunk: '${chunkType}'`,
@@ -575,6 +596,7 @@ export class ModelSpanTracker {
         chunkType,
         sequenceNumber: this.#chunkSequence,
       },
+      tracingPolicy: this.#modelSpan?.tracingPolicy,
     });
     this.#currentChunkType = chunkType;
     this.#accumulator = initialData || {};
@@ -615,10 +637,7 @@ export class ModelSpanTracker {
     output: any,
     options?: { attributes?: Record<string, any>; metadata?: Record<string, any> },
   ) {
-    // Auto-create step if we see a chunk before step-start
-    if (!this.#currentStepSpan) {
-      this.startStep();
-    }
+    this.#ensureStepAndInference();
 
     const span = this.#chunkParent()?.createEventSpan({
       name: `chunk: '${chunkType}'`,
@@ -630,6 +649,7 @@ export class ModelSpanTracker {
       },
       metadata: options?.metadata,
       output,
+      tracingPolicy: this.#modelSpan?.tracingPolicy,
     });
 
     if (span) {
@@ -768,10 +788,7 @@ export class ModelSpanTracker {
     if (chunk.type !== 'tool-call-approval') return;
     const payload = chunk.payload;
 
-    // Auto-create step if we see a chunk before step-start
-    if (!this.#currentStepSpan) {
-      this.startStep();
-    }
+    this.#ensureStepAndInference();
 
     // Create an event span for the approval request
     // Using createEventSpan since approvals are point-in-time events (not time ranges)
@@ -783,6 +800,7 @@ export class ModelSpanTracker {
         sequenceNumber: this.#chunkSequence,
       },
       output: payload,
+      tracingPolicy: this.#modelSpan?.tracingPolicy,
     });
 
     if (span) {
@@ -843,6 +861,13 @@ export class ModelSpanTracker {
                 this.updateStep(chunk.payload);
               } else {
                 this.startStep(chunk.payload);
+              }
+              // step-start fires when the provider stream has begun. Open the
+              // inference span here as a safety net for callers that don't
+              // explicitly call startInference() before invoking the model —
+              // chunks that follow will parent under MODEL_INFERENCE.
+              if (!this.#currentInferenceSpan) {
+                this.startInference(chunk.payload);
               }
               break;
 
