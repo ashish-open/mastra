@@ -40,6 +40,55 @@ async function queryKnowledgeDB(embedding: number[], topK: number, product?: str
   }));
 }
 
+export type KnowledgeProduct = 'optotax' | 'open-money' | 'connected-banking';
+
+export interface KnowledgeHit {
+  text: string;
+  product: string;
+  type: string;
+  source: string;
+  publicUrl: string;
+  score: number;
+}
+
+export type KnowledgeSearchResult =
+  | { found: false; message: string }
+  | { found: true; results: KnowledgeHit[] };
+
+/**
+ * Plain (LLM-free) knowledge-base search. Same logic as the `search-knowledge`
+ * tool — extracted so workflow steps can call it deterministically (e.g. the
+ * support-triage retrieval step) without going through the agent tool-use loop.
+ */
+export async function searchKnowledgeRaw(
+  query: string,
+  product?: KnowledgeProduct,
+): Promise<KnowledgeSearchResult> {
+  try {
+    const embedding = await embedOne(query);
+    const results = await queryKnowledgeDB(embedding, 5, product);
+
+    if (results.length === 0) {
+      return { found: false, message: 'No relevant content found in the knowledge base.' };
+    }
+
+    return {
+      found: true,
+      results: results.map(r => ({
+        text: r.metadata.text,
+        product: r.metadata.product,
+        type: r.metadata.type,
+        source: r.metadata.source,
+        publicUrl: r.metadata.publicUrl ?? '',
+        score: r.score,
+      })),
+    };
+  } catch (err) {
+    console.error('[search-knowledge] error:', err);
+    return { found: false, message: `Search failed: ${(err as Error).message}` };
+  }
+}
+
 export const searchKnowledge = createTool({
   id: 'search-knowledge',
   description:
@@ -51,31 +100,7 @@ export const searchKnowledge = createTool({
       .optional()
       .describe('Narrow the search to a specific product. Omit to search across all products. NOTE: Zwitch docs are NOT in this KB — use the Zwitch MCP tools (search_docs/read_doc) for Zwitch.'),
   }),
-  execute: async ({ query, product }) => {
-    try {
-      const embedding = await embedOne(query);
-      const results = await queryKnowledgeDB(embedding, 5, product);
-
-      if (results.length === 0) {
-        return { found: false, message: 'No relevant content found in the knowledge base.' };
-      }
-
-      return {
-        found: true,
-        results: results.map(r => ({
-          text: r.metadata.text,
-          product: r.metadata.product,
-          type: r.metadata.type,
-          source: r.metadata.source,
-          publicUrl: r.metadata.publicUrl ?? '',
-          score: r.score,
-        })),
-      };
-    } catch (err) {
-      console.error('[search-knowledge] error:', err);
-      return { found: false, message: `Search failed: ${(err as Error).message}` };
-    }
-  },
+  execute: async ({ query, product }) => searchKnowledgeRaw(query, product),
 });
 
 export const knowledgeAgent = new Agent({

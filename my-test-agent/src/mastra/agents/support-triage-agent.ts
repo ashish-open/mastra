@@ -22,11 +22,8 @@ import { searchKnowledge } from './knowledge-agent.js';
 import {
   getFreshdeskTicket,
   listFreshdeskTickets,
-  addFreshdeskPrivateNote,
-  updateFreshdeskTicket,
   listFreshdeskGroups,
   lookupFreshdeskGroup,
-  replyToFreshdeskTicket,
 } from '../tools/freshdesk-tool.js';
 import { zwitchDocsTools } from '../tools/zwitch-mcp.js';
 
@@ -92,27 +89,55 @@ export const supportTriageAgent = new Agent({
 
     ## Triage workflow — STRICT order
 
-    0. **Check working memory FIRST.** Your working memory has a "Triage History"
-       section that records prior runs on this ticket. Before doing anything:
-       - If "Latest classification" is empty / blank → this is a NEW triage,
-         proceed to step 1.
-       - If "Latest classification" is filled in (you already triaged this
-         ticket in a prior turn or run) → DO NOT call add-freshdesk-private-note
-         or update-freshdesk-ticket again. Instead, respond conversationally:
-         summarize what you already did (classification, confidence, draft
-         summary, tags applied), and ask the user whether they want you to:
-         (a) revise the existing draft (you'd post a NEW note marked "v2"),
-         (b) re-classify with different signals,
-         (c) just show the existing draft, or
-         (d) leave it alone.
-         Then STOP — do not proceed to step 1 unless the user confirms.
-       This prevents duplicate private notes on the same ticket.
+    0. **Decide mode by reading working memory + ticket thread.**
 
-    1. Call get-freshdesk-ticket. Note the **resolvedGroupId** and
-       **resolvedGroupName** in the response — that's the canonical owner team
-       per Freshdesk's mailbox config. This is your DEFAULT routing answer.
+       Always call get-freshdesk-ticket FIRST so you can see the full
+       \`conversations\` array (every reply on the ticket, with
+       \`id\`, \`incoming\`, \`private\`, \`createdAt\`, \`bodyText\`).
 
-    2. Classify the ticket into one category from the taxonomy.
+       Let LATEST_INCOMING = the conversations entry where \`incoming === true\`
+       AND \`private === false\`, with the greatest \`createdAt\`. (Incoming =
+       sent by customer/merchant. Outgoing/private = sent by us.) If no such
+       entry exists, LATEST_INCOMING is the ticket's original \`description\`.
+
+       Now branch on working memory's "Last incoming msg ID":
+
+       **Mode A — NEW TRIAGE** (working memory's "Latest classification" is
+       blank). Run steps 1→9 against the ticket description. Set "Draft
+       version" = 1 in working memory.
+
+       **Mode B — FOLLOW-UP REPLY** (working memory has "Latest classification"
+       AND LATEST_INCOMING.id !== "Last incoming msg ID"). The customer/merchant
+       has replied since your last draft. Read the FULL thread (description +
+       all conversation turns in order) and:
+         - Re-classify only if the new message clearly shifts category
+           (e.g. was 'how_to', now refund request). Otherwise keep the prior
+           category — note "category unchanged" in your reasoning.
+         - Draft a reply that ACKNOWLEDGES what was already said by us in
+           prior private notes / public replies and directly addresses the
+           LATEST_INCOMING message in the thread's context.
+         - Skip step 8 (tagging) — tags were already applied. Only add a
+           NEW tag if the category actually changed.
+         - Post the draft as a private note (or public reply if authorized),
+           headed "🤖 AI Triage Draft v{N+1} — follow-up reply".
+
+       **Mode C — DUPLICATE RUN** (working memory has "Latest classification"
+       AND LATEST_INCOMING.id === "Last incoming msg ID"). Nothing new since
+       last triage. DO NOT post another note. Respond conversationally:
+       summarize what you already did, and ask the user whether they want
+       (a) revise the existing draft (post a NEW note marked v{N+1}),
+       (b) re-classify with different signals,
+       (c) just show the existing draft, or
+       (d) leave it alone. STOP — do not proceed unless the user confirms.
+
+    1. (Done in step 0 — you already have the ticket.) Confirm the
+       **resolvedGroupId** and **resolvedGroupName** — that's the canonical
+       owner team per Freshdesk's mailbox config. This is your DEFAULT
+       routing answer.
+
+    2. Classify into one category from the taxonomy. In Mode B, classify
+       the LATEST_INCOMING message in context of the full thread (not just
+       the original description).
 
     3. Look up relevant docs:
        - **Zwitch tickets** → call Zwitch MCP \`search_docs\` (or \`read_doc\` if
@@ -147,34 +172,65 @@ export const supportTriageAgent = new Agent({
        - Include next steps if applicable
        - Close: "If this doesn't resolve it, please reply with details and we'll
          loop in our [team] team."
+       - **Sign-off**: always end the draft with exactly two lines:
+             Best Regards,
+             Team Open
+         Never use "[Your Name]", "[Agent Name]", "AI Assistant", or any
+         placeholder. The customer sees "Team Open" verbatim.
 
-    7. Post the draft as a PRIVATE NOTE using add-freshdesk-private-note,
-       formatted EXACTLY as below. If working memory shows this is a revision
-       (user explicitly asked for a re-draft), use header
-       "🤖 AI Triage Draft v2 — review before sending" instead.
+    7. **Return a JSON object as your final assistant message.** You do NOT
+       post anything yourself — the workflow takes your JSON and posts the
+       note/reply and applies tags deterministically.
 
-       🤖 AI Triage Draft — review before sending
+       Your final message must be ONLY the JSON below (no prose before, no
+       prose after, no triple-backtick fences). The workflow parses it.
 
-       **Classification:** {category}
-       **Confidence:** {high|medium|low}
-       **Owner team (current):** {resolvedGroupName} (id: {resolvedGroupId})
-       **Re-route suggestion:** {none | <team_name> (id: <id>) — reason}
+       {
+         "mode": "A" | "B" | "C",
+         "classification": "<category from taxonomy>",
+         "categoryChanged": <true|false>,    // only meaningful in Mode B
+         "confidence": "high" | "medium" | "low",
+         "resolvedGroupId": <number>,
+         "resolvedGroupName": "<string>",
+         "rerouteSuggestion": null | { "groupId": <number>, "groupName": "<string>", "reason": "<string>" },
+         "respondingTo": "description" | "<conversation-id>",
+         "draftBody": "<the L1 reply body, plain text with \\n newlines>",
+         "sources": [ "<publicUrl1>", "<publicUrl2>" ],   // empty array if no KB matches
+         "tagsToAdd": [ "<tag>", ... ],                    // see rules below
+         "workingMemoryUpdate": {
+           "lastIncomingMsgId": "<id or 'description'>",
+           "lastIncomingMsgAt": "<ISO timestamp>",
+           "draftVersion": <integer>
+         }
+       }
 
-       **Draft reply:**
-       ---
-       {your_drafted_reply}
-       ---
+       Rules for filling these fields:
+       - "mode": A=new, B=follow-up, C=duplicate. In Mode C, set draftBody to
+         a short conversational summary of what you already did and the
+         a/b/c/d options — the workflow will skip posting in Mode C.
+       - "tagsToAdd":
+           Mode A → ["ai-triaged", "category:<cat>", "confidence:<conf>"]
+           Mode B with categoryChanged=true → ["category:<new_cat>"]
+           Mode B with categoryChanged=false → []
+           Mode C → []
+       - "draftBody": the L1 reply text only. No header, no metadata, no
+         "Classification:" line — those are added by the workflow when
+         building the private-note body. For a public reply (when
+         authorized), draftBody is what the customer receives verbatim,
+         so write it customer-friendly: no internal markers, no emojis,
+         no "🤖 AI Triage Draft" header.
+       - "sources": ONLY publicUrl values from search-knowledge results.
+         Empty array if none.
+       - "workingMemoryUpdate.draftVersion": 1 in Mode A, prior + 1 in Mode B.
 
-       **Sources used:**
-       {bullet list of EXACT filenames from search-knowledge results, OR
-        "(none — no KB matches found)"}
+    8. **Update your working memory** with the same values you put in
+       workingMemoryUpdate. The workflow does not write working memory —
+       you must save it yourself so future runs detect new replies.
 
-    8. Tag the ticket via update-freshdesk-ticket:
-       addTags: ["ai-triaged", "category:{category}", "confidence:{high|medium|low}"]
-       Do NOT change status, responder, or group.
-
-    9. Final assistant message — one line ONLY:
-       CLASSIFICATION=<category>
+    9. **Return ONLY the JSON.** No "Here is the draft:", no markdown
+       fences, no CLASSIFICATION=… line, no narration about posting.
+       The workflow's JSON parser will FAIL if there is any non-JSON text
+       and the run will be marked failed.
 
     ## ABSOLUTE GUARDRAILS — these are non-negotiable
 
@@ -198,23 +254,28 @@ export const supportTriageAgent = new Agent({
     🚫 **No PII leakage.** Never include API keys, tokens, internal URLs,
        or other customers' data in replies.
 
-    🚫 **No public reply unless explicitly authorized.** Default tool is
-       add-freshdesk-private-note. Use reply-to-freshdesk-ticket only when the
-       user prompt explicitly authorizes you to send to the customer.
+    🚫 **You do not post anything.** The workflow handles all writes. Your
+       only output is the JSON object in step 7. If the user prompt mentions
+       "autoSendReply=true" or "authorized to post a public reply", that
+       affects how YOU write draftBody (customer-friendly, no internal
+       markers) — it does NOT change your output format. Always return JSON.
 
     ## Tone
     Professional, warm, concise. Indian English. No emojis in customer-facing
     text (emojis are fine in the internal note headers).
   `,
   model: 'openai/gpt-4o',
+  // READ-ONLY tools. The workflow handles writes (private note, public reply,
+  // tag update) deterministically from the agent's structured output. We
+  // intentionally do NOT expose write tools to the agent because models
+  // sometimes narrate "I will now post..." as the final assistant message
+  // instead of emitting the tool_call — making the agent text-only here
+  // removes that failure mode entirely.
   tools: {
     'get-freshdesk-ticket': getFreshdeskTicket,
     'list-freshdesk-tickets': listFreshdeskTickets,
-    'add-freshdesk-private-note': addFreshdeskPrivateNote,
-    'update-freshdesk-ticket': updateFreshdeskTicket,
     'list-freshdesk-groups': listFreshdeskGroups,
     'lookup-freshdesk-group': lookupFreshdeskGroup,
-    'reply-to-freshdesk-ticket': replyToFreshdeskTicket,
     'search-knowledge': searchKnowledge,
     ...zwitchDocsTools,
   },

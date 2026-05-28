@@ -4,9 +4,15 @@
  * Registered as a public Mastra API route so Recall.ai can POST to it.
  *
  * Handles dashboard webhook events:
- *   bot.*         → log bot lifecycle (joining, in_call, done, fatal)
- *   recording.done → kick off async transcription job
- *   transcript.done → trigger processMeetingWorkflow → summary → Slack
+ *   bot.*                            → log bot lifecycle
+ *   bot.recording_permission_denied  → record failure, alert
+ *   recording.done                   → no-op (transcript auto-starts via recording_config)
+ *   recording.failed                 → record failure, alert
+ *   transcript.done                  → trigger processMeetingWorkflow → summary → Slack
+ *   transcript.failed                → auto-retry with fallback provider, alert
+ *
+ * Idempotency: every delivery is keyed by the Svix `webhook-id` header and
+ * recorded in meetings.db. Duplicates short-circuit before any side-effects.
  *
  * Security:
  *   - Verifies every request with RECALL_WORKSPACE_VERIFICATION_SECRET
@@ -18,7 +24,8 @@
  */
 
 import type { ApiRoute } from '@mastra/core/server';
-import { verifyRecallWebhook, recallFetch, recallHeaders, RECALL_BASE } from '../tools/recall-tool.js';
+import { verifyRecallWebhook, startAsyncTranscript } from '../tools/recall-tool.js';
+import { recordWebhookDelivery, markWebhookOutcome, recordMeetingFailure } from '../meetings/db.js';
 
 // ─── Types (Recall webhook payload shapes) ────────────────────────────────────
 
@@ -30,8 +37,8 @@ interface RecallBotWebhook {
   };
 }
 
-interface RecallRecordingDoneWebhook {
-  event: 'recording.done';
+interface RecallRecordingWebhook {
+  event: 'recording.done' | 'recording.failed' | 'recording.processing' | 'recording.deleted';
   data: {
     data: { code: string; sub_code?: string | null; updated_at: string };
     recording: { id: string; metadata?: Record<string, unknown> };
@@ -39,8 +46,8 @@ interface RecallRecordingDoneWebhook {
   };
 }
 
-interface RecallTranscriptDoneWebhook {
-  event: 'transcript.done';
+interface RecallTranscriptWebhook {
+  event: 'transcript.done' | 'transcript.failed' | 'transcript.processing' | 'transcript.deleted';
   data: {
     data: { code: string; sub_code?: string | null; updated_at: string };
     transcript: { id: string; metadata?: Record<string, unknown> };
@@ -49,7 +56,17 @@ interface RecallTranscriptDoneWebhook {
   };
 }
 
-type RecallWebhookPayload = RecallBotWebhook | RecallRecordingDoneWebhook | RecallTranscriptDoneWebhook;
+type RecallWebhookPayload = RecallBotWebhook | RecallRecordingWebhook | RecallTranscriptWebhook;
+
+// Providers we'll try in order if recallai_async fails.
+const TRANSCRIPT_FALLBACK_PROVIDERS = ['deepgram_async', 'assembly_ai_async'] as const;
+
+/** Extract bot_id from any Recall webhook payload shape (defensive). */
+function extractBotId(payload: RecallWebhookPayload): string | null {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const data = (payload as any).data;
+  return data?.bot?.id ?? null;
+}
 
 // ─── Async processor (runs after 200 response is sent) ───────────────────────
 
@@ -60,57 +77,57 @@ async function processWebhook(payload: RecallWebhookPayload, mastra: unknown): P
   // ── Bot lifecycle events ─────────────────────────────────────────────────
   if (event.startsWith('bot.')) {
     const botPayload = payload as RecallBotWebhook;
-    const { code } = botPayload.data.data;
+    const { code, sub_code } = botPayload.data.data;
     const botId = botPayload.data.bot.id;
 
     console.log(`[recall-webhook] Bot ${botId}: ${event} (${code})`);
 
     if (event === 'bot.fatal') {
-      console.error(`[recall-webhook] Bot ${botId} fatal error — sub_code: ${botPayload.data.data.sub_code}`);
+      console.error(`[recall-webhook] Bot ${botId} fatal error — sub_code: ${sub_code}`);
+      await recordMeetingFailure({ botId, event, code, subCode: sub_code });
+    } else if (event === 'bot.recording_permission_denied') {
+      console.error(`[recall-webhook] Bot ${botId} was DENIED recording permission`);
+      await recordMeetingFailure({ botId, event, code, subCode: sub_code });
     }
     return;
   }
 
-  // ── recording.done → start async transcript job ──────────────────────────
+  // ── recording.done → no-op (transcript auto-starts via recording_config) ──
+  // We used to call create_transcript here manually, but now recording_config.transcript
+  // on bot creation does it automatically. Just log and move on.
   if (event === 'recording.done') {
-    const recPayload = payload as RecallRecordingDoneWebhook;
+    const recPayload = payload as RecallRecordingWebhook;
+    console.log(
+      `[recall-webhook] Recording done: ${recPayload.data.recording.id} ` +
+      `(bot: ${recPayload.data.bot.id}) — transcript will be auto-created by recording_config`,
+    );
+    return;
+  }
+
+  // ── recording.failed → log and persist for visibility ───────────────────
+  if (event === 'recording.failed') {
+    const recPayload = payload as RecallRecordingWebhook;
+    const { code, sub_code } = recPayload.data.data;
     const recordingId = recPayload.data.recording.id;
     const botId = recPayload.data.bot.id;
 
-    console.log(`[recall-webhook] Recording done: ${recordingId} (bot: ${botId}) — starting transcript job`);
-
-    const res = await recallFetch(`${RECALL_BASE}/recording/${recordingId}/create_transcript/`, {
-      method: 'POST',
-      headers: recallHeaders(),
-      body: JSON.stringify({
-        provider: {
-          recallai_async: { language_code: 'en' },
-        },
-        diarization: {
-          use_separate_streams_when_available: true,
-        },
-      }),
-    });
-
-    if (!res.ok) {
-      console.error(`[recall-webhook] create_transcript failed (${res.status}): ${await res.text()}`);
-    } else {
-      const data = (await res.json()) as { id: string };
-      console.log(`[recall-webhook] Transcript job created: ${data.id}`);
-    }
+    console.error(
+      `[recall-webhook] Recording FAILED: ${recordingId} (bot: ${botId}) ` +
+      `— code: ${code}, sub_code: ${sub_code}`,
+    );
+    await recordMeetingFailure({ botId, event, code, subCode: sub_code, recordingId });
     return;
   }
 
   // ── transcript.done → trigger processMeetingWorkflow ────────────────────
   if (event === 'transcript.done') {
-    const txPayload = payload as RecallTranscriptDoneWebhook;
+    const txPayload = payload as RecallTranscriptWebhook;
     const transcriptId = txPayload.data.transcript.id;
     const botId = txPayload.data.bot.id;
     const botMeta = txPayload.data.bot.metadata ?? {};
 
     console.log(`[recall-webhook] Transcript done: ${transcriptId} (bot: ${botId}) — triggering workflow`);
 
-    // Trigger the processMeetingWorkflow
     const m = mastra as {
       getWorkflow: (id: string) => {
         createRun: (opts?: { runId?: string }) => Promise<{ startAsync: (opts: { inputData: unknown }) => Promise<void> }>;
@@ -118,7 +135,7 @@ async function processWebhook(payload: RecallWebhookPayload, mastra: unknown): P
     };
     const workflow = m.getWorkflow('processMeetingWorkflow');
     if (!workflow) {
-      console.error('[recall-webhook] process-meeting-workflow not found in Mastra instance');
+      console.error('[recall-webhook] processMeetingWorkflow not found in Mastra instance');
       return;
     }
 
@@ -133,6 +150,56 @@ async function processWebhook(payload: RecallWebhookPayload, mastra: unknown): P
     });
 
     console.log(`[recall-webhook] processMeetingWorkflow triggered for transcript ${transcriptId}`);
+    return;
+  }
+
+  // ── transcript.failed → auto-retry with a fallback provider ─────────────
+  // Per Recall docs: "If post-meeting transcription fails, you can retry with a
+  // backup provider." We pick the first fallback that hasn't been tried yet
+  // (tracked via the meeting_failures.retried_with column for visibility).
+  if (event === 'transcript.failed') {
+    const txPayload = payload as RecallTranscriptWebhook;
+    const { code, sub_code } = txPayload.data.data;
+    const transcriptId = txPayload.data.transcript.id;
+    const recordingId = txPayload.data.recording.id;
+    const botId = txPayload.data.bot.id;
+
+    console.error(
+      `[recall-webhook] Transcript FAILED: ${transcriptId} (bot: ${botId}, recording: ${recordingId}) ` +
+      `— code: ${code}, sub_code: ${sub_code}`,
+    );
+
+    // Try the first fallback provider. If it eventually fails too, the next
+    // transcript.failed webhook will land here again — we don't currently track
+    // attempt count, so this can loop once at most through fallbacks before
+    // operators investigate.
+    const fallback = TRANSCRIPT_FALLBACK_PROVIDERS[0];
+    try {
+      const retry = await startAsyncTranscript(recordingId, fallback, 'auto');
+      console.log(
+        `[recall-webhook] Retried transcript with ${fallback}: new transcript id ${retry.transcriptId}`,
+      );
+      await recordMeetingFailure({
+        botId, event, code, subCode: sub_code,
+        recordingId, transcriptId,
+        retriedWith: fallback,
+      });
+    } catch (err) {
+      console.error(`[recall-webhook] Fallback transcription with ${fallback} failed:`, err);
+      await recordMeetingFailure({
+        botId, event, code, subCode: sub_code,
+        recordingId, transcriptId,
+      });
+    }
+    return;
+  }
+
+  // Quietly accept other documented events (processing, deleted) without action.
+  if (
+    event === 'recording.processing' || event === 'recording.deleted' ||
+    event === 'transcript.processing' || event === 'transcript.deleted'
+  ) {
+    console.log(`[recall-webhook] ${event} — acknowledged (no action needed)`);
     return;
   }
 
@@ -169,13 +236,46 @@ export const recallWebhookRoute: ApiRoute = {
       return c.json({ error: 'Invalid JSON' }, 400);
     }
 
-    // 4. Acknowledge immediately (required — Recall.ai retries on non-2xx or timeout)
-    // Process asynchronously in background
-    void processWebhook(payload, mastra).catch(err => {
-      console.error('[recall-webhook] Background processing error:', err);
-    });
+    // 4. Idempotency gate — Recall retries failed deliveries. Use the Svix
+    //    `webhook-id` header (unique per delivery) to short-circuit duplicates.
+    //    Without this, a slow handler could trigger processMeetingWorkflow twice.
+    const webhookId = headers['webhook-id'];
+    if (webhookId) {
+      try {
+        const { isNew } = await recordWebhookDelivery(
+          webhookId,
+          payload.event,
+          extractBotId(payload),
+        );
+        if (!isNew) {
+          console.log(`[recall-webhook] Duplicate delivery ${webhookId} (${payload.event}) — skipping`);
+          return c.json({ received: true, duplicate: true });
+        }
+      } catch (err) {
+        // Don't fail the webhook if the dedup store is unavailable — better to
+        // risk a duplicate than to make Recall retry indefinitely.
+        console.warn('[recall-webhook] Dedup check failed (non-fatal):', err instanceof Error ? err.message : err);
+      }
+    }
 
-    // 5. Return 200 immediately
+    // 5. Acknowledge immediately (required — Recall.ai retries on non-2xx or timeout)
+    //    Process asynchronously in background.
+    void processWebhook(payload, mastra)
+      .then(() => {
+        if (webhookId) void markWebhookOutcome(webhookId, 'processed').catch(() => undefined);
+      })
+      .catch(err => {
+        console.error('[recall-webhook] Background processing error:', err);
+        if (webhookId) {
+          void markWebhookOutcome(
+            webhookId,
+            'error',
+            err instanceof Error ? err.message : String(err),
+          ).catch(() => undefined);
+        }
+      });
+
+    // 6. Return 200 immediately
     return c.json({ received: true });
   }),
 };

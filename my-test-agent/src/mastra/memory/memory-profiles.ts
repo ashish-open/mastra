@@ -56,7 +56,10 @@ const ZEUS_TEMPLATE = `# Mandate State
   - <merchant> — reason: <out-of-mandate / failed-cryptogram / failed-payment>
 `;
 
-/** Support Triage — runs once per ticket. Resource-scoped per Freshdesk ticket. */
+/** Support Triage — runs once per ticket, then again for each new incoming
+ *  reply on that ticket. Resource-scoped per Freshdesk ticket so the agent
+ *  can detect "customer replied again since my last draft" via the
+ *  Last-incoming-msg fields. */
 const SUPPORT_TRIAGE_TEMPLATE = `# Ticket Context
 
 - **Ticket ID**:
@@ -70,6 +73,9 @@ const SUPPORT_TRIAGE_TEMPLATE = `# Ticket Context
 - **Latest classification**: <category>
 - **Confidence**: <high/medium/low>
 - **Tags applied**: <ai-triaged, category:X, ...>
+- **Last incoming msg ID**: <conversation.id of the most recent INCOMING msg you've responded to — leave blank on first triage>
+- **Last incoming msg at**: <ISO timestamp of that incoming msg, e.g. 2026-05-21T03:14:15Z>
+- **Draft version**: <integer; 1 on first triage, +1 per follow-up reply>
 
 # Notes for Human Reviewer
 

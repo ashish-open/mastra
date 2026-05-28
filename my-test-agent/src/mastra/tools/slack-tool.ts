@@ -34,6 +34,84 @@ function resolveWebhookUrl(channel: string): string | null {
   return process.env[envKey] ?? process.env.SLACK_WEBHOOK_URL ?? null;
 }
 
+// ─── Plain helper — used by deterministic workflow steps ─────────────────────
+//
+// Same payload shape as the postToSlack tool, but exported as a plain async
+// function so workflows can post WITHOUT routing through an LLM. We saw
+// the meeting agent narrate "I will now post this summary to the Slack
+// channel 'sales'..." as its final assistant message instead of emitting
+// the tool_call — then the workflow hardcoded slackPosted:true and we
+// never knew. The fix is to remove the tool from the agent entirely and
+// have the workflow drive the post itself.
+
+export interface SlackPostInput {
+  channel: 'sales' | 'onboarding' | 'ops' | 'support' | 'finance' | 'product' | 'engineering' | 'hr' | 'general' | 'default';
+  title: string;
+  body: string;
+  fields?: Array<{ label: string; value: string }>;
+  emoji?: string;
+}
+
+export interface SlackPostResult {
+  success: boolean;
+  channel: string;
+  skipped?: boolean;
+  error?: string;
+}
+
+/** Post a Block Kit message to the channel's configured Incoming Webhook.
+ *  Returns success=false (not throw) when no webhook is configured for that
+ *  channel — workflow callers can decide whether to surface that or ignore it. */
+export async function postSlackMessage(input: SlackPostInput): Promise<SlackPostResult> {
+  const channel = input.channel ?? 'default';
+  const webhookUrl = resolveWebhookUrl(channel);
+  if (!webhookUrl) {
+    console.warn(`[slack] No webhook URL configured for channel "${channel}" — skipping post`);
+    return { success: false, channel, skipped: true };
+  }
+
+  const blocks: unknown[] = [
+    {
+      type: 'header',
+      text: { type: 'plain_text', text: `${input.emoji ?? '📋'} ${input.title}`, emoji: true },
+    },
+    { type: 'section', text: { type: 'mrkdwn', text: input.body } },
+  ];
+
+  if (input.fields?.length) {
+    blocks.push({ type: 'divider' });
+    blocks.push({
+      type: 'section',
+      fields: input.fields.map(f => ({ type: 'mrkdwn', text: `*${f.label}*\n${f.value}` })),
+    });
+  }
+
+  blocks.push({
+    type: 'context',
+    elements: [
+      {
+        type: 'mrkdwn',
+        text: `Posted by Note Taker AI · ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`,
+      },
+    ],
+  });
+
+  const res = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ blocks }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    console.error(`[slack] Post failed (${res.status}): ${err}`);
+    return { success: false, channel, error: `Slack post failed (${res.status}): ${err}` };
+  }
+
+  console.log(`[slack] (workflow) Posted to #${channel}: ${input.title}`);
+  return { success: true, channel };
+}
+
 export const postToSlack = createTool({
   id: 'post-to-slack',
   description:

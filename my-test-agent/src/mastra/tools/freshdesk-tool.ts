@@ -106,6 +106,93 @@ export function verifyFreshdeskWebhook(rawBody: string, headers: Record<string, 
 
 // ─── Tool: Get Ticket (with conversations) ────────────────────────────────────
 
+/**
+ * Plain helper: fetch a Freshdesk ticket + full conversation thread + derived
+ * routing signals. Same shape as the `get-freshdesk-ticket` tool result. Exists
+ * separately so the workflow can call it deterministically (without going
+ * through the LLM tool-use loop) — important for computing LATEST_INCOMING
+ * before invoking the agent.
+ */
+export async function fetchFreshdeskTicket(ticketId: number) {
+  const base = freshdeskBase();
+
+  const [ticketRes, convRes] = await Promise.all([
+    freshdeskFetch(`${base}/tickets/${ticketId}?include=requester,stats`, { headers: jsonHeaders() }),
+    freshdeskFetch(`${base}/tickets/${ticketId}/conversations`, { headers: jsonHeaders() }),
+  ]);
+
+  if (!ticketRes.ok) throw new Error(`Get ticket failed (${ticketRes.status}): ${await ticketRes.text()}`);
+  if (!convRes.ok) throw new Error(`Get conversations failed (${convRes.status}): ${await convRes.text()}`);
+
+  const ticket = (await ticketRes.json()) as Record<string, unknown>;
+  const conversations = (await convRes.json()) as Array<Record<string, unknown>>;
+
+  // Resolve the canonical group from the inbound mailbox (email_config_id).
+  // This is the most reliable routing signal — it matches Freshdesk's own config.
+  const emailConfigId = ticket.email_config_id as number | null;
+  const toEmail = ((ticket.to_emails as string[]) ?? []).map(e => e.toLowerCase());
+  let mailboxGroupId: number | null = null;
+  if (emailConfigId && MAILBOX_TO_GROUP[emailConfigId]) {
+    mailboxGroupId = MAILBOX_TO_GROUP[emailConfigId];
+  } else {
+    for (const e of toEmail) {
+      if (EMAIL_TO_GROUP[e]) { mailboxGroupId = EMAIL_TO_GROUP[e]; break; }
+    }
+  }
+  const resolvedGroupId = (ticket.group_id as number | null) ?? mailboxGroupId ?? PEG_DEFAULT_GROUP_ID;
+  const resolvedGroupName = GROUP_NAME_BY_ID.get(resolvedGroupId) ?? 'Product Experience & Growth';
+
+  return {
+    id: ticket.id as number,
+    subject: ticket.subject as string,
+    description: ticket.description_text as string,
+    status: ticket.status as number,
+    priority: ticket.priority as number,
+    tags: (ticket.tags as string[]) ?? [],
+    groupId: ticket.group_id as number | null,
+    responderId: ticket.responder_id as number | null,
+    requester: ticket.requester ?? null,
+    // ─── Routing signals (derived) ─────────────────────────────────
+    emailConfigId,
+    toEmails: toEmail,
+    mailboxGroupId,
+    resolvedGroupId,
+    resolvedGroupName,
+    // ───────────────────────────────────────────────────────────────
+    createdAt: ticket.created_at as string,
+    updatedAt: ticket.updated_at as string,
+    conversations: conversations.map(c => ({
+      id: c.id as number,
+      bodyText: c.body_text as string,
+      fromEmail: c.from_email as string,
+      private: c.private as boolean,
+      incoming: c.incoming as boolean,
+      createdAt: c.created_at as string,
+    })),
+  };
+}
+
+export type FreshdeskTicketDetail = Awaited<ReturnType<typeof fetchFreshdeskTicket>>;
+
+/**
+ * Find the latest INCOMING (customer-sent, non-private) conversation entry.
+ * Returns `{ id: 'description', at: ticket.createdAt }` when no incoming reply
+ * exists — i.e. only the original ticket description is visible to triage.
+ *
+ * The workflow uses this to deterministically decide Mode A/B/C BEFORE calling
+ * the LLM. Doing this in the agent prompt has proved unreliable: with a
+ * non-empty working memory, the model frequently short-circuits to Mode C
+ * without re-checking conversations[].
+ */
+export function findLatestIncoming(ticket: FreshdeskTicketDetail): { id: string; at: string } {
+  const incoming = ticket.conversations.filter(c => c.incoming === true && c.private === false);
+  if (incoming.length === 0) {
+    return { id: 'description', at: ticket.createdAt };
+  }
+  incoming.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  return { id: String(incoming[0].id), at: incoming[0].createdAt };
+}
+
 export const getFreshdeskTicket = createTool({
   id: 'get-freshdesk-ticket',
   description:
@@ -113,65 +200,82 @@ export const getFreshdeskTicket = createTool({
   inputSchema: z.object({
     ticketId: z.number().describe('Freshdesk ticket ID'),
   }),
-  execute: async ({ ticketId }) => {
-    const base = freshdeskBase();
-
-    const [ticketRes, convRes] = await Promise.all([
-      freshdeskFetch(`${base}/tickets/${ticketId}?include=requester,stats`, { headers: jsonHeaders() }),
-      freshdeskFetch(`${base}/tickets/${ticketId}/conversations`, { headers: jsonHeaders() }),
-    ]);
-
-    if (!ticketRes.ok) throw new Error(`Get ticket failed (${ticketRes.status}): ${await ticketRes.text()}`);
-    if (!convRes.ok) throw new Error(`Get conversations failed (${convRes.status}): ${await convRes.text()}`);
-
-    const ticket = (await ticketRes.json()) as Record<string, unknown>;
-    const conversations = (await convRes.json()) as Array<Record<string, unknown>>;
-
-    // Resolve the canonical group from the inbound mailbox (email_config_id).
-    // This is the most reliable routing signal — it matches Freshdesk's own config.
-    const emailConfigId = ticket.email_config_id as number | null;
-    const toEmail = ((ticket.to_emails as string[]) ?? []).map(e => e.toLowerCase());
-    let mailboxGroupId: number | null = null;
-    if (emailConfigId && MAILBOX_TO_GROUP[emailConfigId]) {
-      mailboxGroupId = MAILBOX_TO_GROUP[emailConfigId];
-    } else {
-      for (const e of toEmail) {
-        if (EMAIL_TO_GROUP[e]) { mailboxGroupId = EMAIL_TO_GROUP[e]; break; }
-      }
-    }
-    const resolvedGroupId = (ticket.group_id as number | null) ?? mailboxGroupId ?? PEG_DEFAULT_GROUP_ID;
-    const resolvedGroupName = GROUP_NAME_BY_ID.get(resolvedGroupId) ?? 'Product Experience & Growth';
-
-    return {
-      id: ticket.id as number,
-      subject: ticket.subject as string,
-      description: ticket.description_text as string,
-      status: ticket.status as number,
-      priority: ticket.priority as number,
-      tags: (ticket.tags as string[]) ?? [],
-      groupId: ticket.group_id as number | null,
-      responderId: ticket.responder_id as number | null,
-      requester: ticket.requester ?? null,
-      // ─── Routing signals (derived) ─────────────────────────────────
-      emailConfigId,
-      toEmails: toEmail,
-      mailboxGroupId,
-      resolvedGroupId,
-      resolvedGroupName,
-      // ───────────────────────────────────────────────────────────────
-      createdAt: ticket.created_at as string,
-      updatedAt: ticket.updated_at as string,
-      conversations: conversations.map(c => ({
-        id: c.id as number,
-        bodyText: c.body_text as string,
-        fromEmail: c.from_email as string,
-        private: c.private as boolean,
-        incoming: c.incoming as boolean,
-        createdAt: c.created_at as string,
-      })),
-    };
-  },
+  execute: async ({ ticketId }) => fetchFreshdeskTicket(ticketId),
 });
+
+/**
+ * Fetch the same requester's recent tickets (excluding the current one) so the
+ * triage workflow can tell whether this is a repeat issue, an active customer
+ * with many open tickets, a returning customer asking again, etc.
+ *
+ * Best-effort: returns an empty array if requester_id is unknown or Freshdesk
+ * returns an error (the triage workflow degrades gracefully without history).
+ */
+export async function fetchRequesterRecentTickets(
+  requesterId: number | null | undefined,
+  opts: { excludeTicketId?: number; limit?: number } = {},
+): Promise<
+  Array<{
+    id: number;
+    subject: string;
+    status: number;
+    priority: number;
+    groupId: number | null;
+    tags: string[];
+    createdAt: string;
+    updatedAt: string;
+  }>
+> {
+  if (!requesterId) return [];
+  const limit = opts.limit ?? 10;
+  try {
+    const url = new URL(`${freshdeskBase()}/tickets`);
+    url.searchParams.set('requester_id', String(requesterId));
+    url.searchParams.set('per_page', String(Math.min(limit + 1, 100)));
+    url.searchParams.set('order_by', 'updated_at');
+    url.searchParams.set('order_type', 'desc');
+    const res = await freshdeskFetch(url.toString(), { headers: jsonHeaders() });
+    if (!res.ok) {
+      console.warn(`[freshdesk] requester-history fetch returned ${res.status} for requester ${requesterId}`);
+      return [];
+    }
+    const rows = (await res.json()) as Array<Record<string, unknown>>;
+    return rows
+      .filter(t => (t.id as number) !== opts.excludeTicketId)
+      .slice(0, limit)
+      .map(t => ({
+        id: t.id as number,
+        subject: (t.subject as string) ?? '',
+        status: t.status as number,
+        priority: t.priority as number,
+        groupId: (t.group_id as number | null) ?? null,
+        tags: (t.tags as string[]) ?? [],
+        createdAt: t.created_at as string,
+        updatedAt: t.updated_at as string,
+      }));
+  } catch (err) {
+    console.warn(`[freshdesk] requester-history fetch failed: ${(err as Error).message}`);
+    return [];
+  }
+}
+
+/** Freshdesk status code → human label. */
+export const FRESHDESK_STATUS_LABEL: Record<number, string> = {
+  2: 'open',
+  3: 'pending',
+  4: 'resolved',
+  5: 'closed',
+  6: 'waiting-on-customer',
+  7: 'waiting-on-third-party',
+};
+
+/** Freshdesk priority code → human label. */
+export const FRESHDESK_PRIORITY_LABEL: Record<number, string> = {
+  1: 'low',
+  2: 'medium',
+  3: 'high',
+  4: 'urgent',
+};
 
 // ─── Tool: List Recent Tickets ────────────────────────────────────────────────
 
@@ -345,6 +449,71 @@ export const updateFreshdeskTicket = createTool({
     return { ticketId, updated: true, fields: Object.keys(payload) };
   },
 });
+
+// ─── Plain helpers — used by deterministic workflow steps ────────────────────
+//
+// These are the same HTTP calls the tools above perform, but exported as plain
+// async functions so workflows can invoke them WITHOUT routing through an LLM.
+// Use these when "post a draft" is a deterministic step in a workflow — relying
+// on an LLM to emit the right tool_call is unreliable (it will sometimes
+// describe the call as text instead of executing it).
+
+/** Post a PRIVATE NOTE on a ticket. Returns the new conversation id. */
+export async function postFreshdeskPrivateNote(args: {
+  ticketId: number;
+  body: string;
+}): Promise<{ conversationId: number; ticketId: number }> {
+  const htmlBody = args.body.replace(/\n/g, '<br>');
+  const res = await freshdeskFetch(`${freshdeskBase()}/tickets/${args.ticketId}/notes`, {
+    method: 'POST',
+    headers: jsonHeaders(),
+    body: JSON.stringify({ body: htmlBody, private: true }),
+  });
+  if (!res.ok) throw new Error(`Add note failed (${res.status}): ${await res.text()}`);
+  const data = (await res.json()) as { id: number };
+  console.log(`[freshdesk] (workflow) Private note on ticket ${args.ticketId} → conv ${data.id}`);
+  return { conversationId: data.id, ticketId: args.ticketId };
+}
+
+/** Post a PUBLIC REPLY on a ticket. Customer receives this email. */
+export async function postFreshdeskReply(args: {
+  ticketId: number;
+  body: string;
+  cc?: string[];
+}): Promise<{ conversationId: number; ticketId: number }> {
+  const htmlBody = args.body.replace(/\n/g, '<br>');
+  const payload: Record<string, unknown> = { body: htmlBody };
+  if (args.cc?.length) payload.cc_emails = args.cc;
+  const res = await freshdeskFetch(`${freshdeskBase()}/tickets/${args.ticketId}/reply`, {
+    method: 'POST',
+    headers: jsonHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Reply failed (${res.status}): ${await res.text()}`);
+  const data = (await res.json()) as { id: number };
+  console.log(`[freshdesk] (workflow) Public reply on ticket ${args.ticketId} → conv ${data.id}`);
+  return { conversationId: data.id, ticketId: args.ticketId };
+}
+
+/** Merge-add tags on a ticket. Existing tags are preserved. */
+export async function addFreshdeskTags(args: { ticketId: number; tags: string[] }): Promise<void> {
+  if (!args.tags.length) return;
+  const existing = await freshdeskFetch(`${freshdeskBase()}/tickets/${args.ticketId}`, {
+    headers: jsonHeaders(),
+  });
+  let merged = args.tags;
+  if (existing.ok) {
+    const t = (await existing.json()) as { tags?: string[] };
+    merged = Array.from(new Set([...(t.tags ?? []), ...args.tags]));
+  }
+  const res = await freshdeskFetch(`${freshdeskBase()}/tickets/${args.ticketId}`, {
+    method: 'PUT',
+    headers: jsonHeaders(),
+    body: JSON.stringify({ tags: merged }),
+  });
+  if (!res.ok) throw new Error(`Tag update failed (${res.status}): ${await res.text()}`);
+  console.log(`[freshdesk] (workflow) Tagged ticket ${args.ticketId} with [${args.tags.join(', ')}]`);
+}
 
 // ─── Tool: Lookup Group (local — uses cached routing data, no API call) ─────
 

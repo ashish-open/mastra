@@ -36,6 +36,20 @@ import { zomatoAdapter, zomatoExpectedNetPaise } from './adapters/zomato.js';
 import { zeptoAdapter, zeptoExpectedNetPaise } from './adapters/zepto.js';
 import { tallyERPAdapter, tallyExpectedNetPaise } from './adapters/erp-tally.js';
 import { posAdapter, posZomatoAdapter, posZeptoAdapter } from './adapters/pos.js';
+// Phase 1.6 + Phase 3 settlement-yes-pg adapters. Imported as named exports
+// and explicitly registered inside `ensureConfigsRegistered()` below so the
+// registration timing matches the legacy pattern (avoids side-effect-import
+// tree-shaking surprises during dev / build).
+import { internalPgDbAdapter } from './adapters/internal-pg-db.js';
+import { pgYesMisAdapter } from './adapters/pg-yes-mis.js';
+import { pgYesIncomingAdapter } from './adapters/pg-yes-incoming.js';
+import { pgYesConsolidatedAdapter } from './adapters/pg-yes-consolidated.js';
+import { yesAutoRefundsAdapter } from './adapters/yes-auto-refunds.js';
+// YES Bank disposition rules. Registered explicitly inside
+// ensureConfigsRegistered() (NOT a side-effect import) — the built bundle
+// tree-shakes side-effect-only imports, which left the disposition/settlement/
+// exception reports empty.
+import { registerYesSettlementDisposition } from './disposition/settlement-yes-pg.js';
 
 /** Sentinel exported so `import { RECO_CONFIGS_LOADED }` keeps the file alive. */
 export const RECO_CONFIGS_LOADED = true as const;
@@ -59,6 +73,15 @@ export function ensureConfigsRegistered(): void {
   registerAdapter(posAdapter);
   registerAdapter(posZomatoAdapter);
   registerAdapter(posZeptoAdapter);
+  // YES Bank pilot + DB cross-check adapters.
+  registerAdapter(internalPgDbAdapter);
+  registerAdapter(pgYesMisAdapter);
+  registerAdapter(pgYesIncomingAdapter);
+  registerAdapter(pgYesConsolidatedAdapter);
+  registerAdapter(yesAutoRefundsAdapter);
+
+  // ── Disposition rule sets (separate registry from adapters) ───────────────
+  registerYesSettlementDisposition();
 
   // ── Config 1: Internal Ledger ↔ Zwitch PG ↔ Bank ─────────────────────────
   registerConfig({
@@ -262,9 +285,138 @@ export function ensureConfigsRegistered(): void {
     ],
   });
 
+  // ── Config 8: YES Bank UPI Settlement (Phase 3 pilot) ──────────────────
+  //
+  // Multi-leg cascade per the SOP. Deterministic-only: `llm: 'off'` means
+  // unmatched residual goes to the exception bucket without LLM involvement.
+  //
+  //   Leg 1: PG MIS  ↔  PG Incoming        (composite key: UTR + amount + payer VPA)
+  //   Leg 2: ↳ matched  ↔  internal-pg-db  (confirms our py_id exists for the txn)
+  //   Leg 3: ↳ matched  anti-join  Consolidated  (drop already-settled rows)
+  //   Leg 4: ↳ remaining  ↔  bank YES statement  (batched cash truth)
+  //   Leg 5: anything still unmatched → exception bucket (auto-emitted by workflow)
+  //
+  // Composite key rationale (see docs/RECONCILIATION_AUTOMATION_PROPOSAL.md §7
+  // Risk #9): NPCI RRN can collide across PGs and across retry attempts within
+  // one PG; (UTR, amount, payer_vpa) together disambiguate. Transforms apply
+  // `digits_only` and `strip_whitespace` to defeat Excel data drift.
+  registerConfig({
+    id: 'settlement-yes-pg',
+    name: 'YES Bank UPI Settlement',
+    description:
+      'Multi-leg settlement reconciliation for YES Bank UPI per the finance team\'s SOP. ' +
+      'Deterministic-only (no LLM in decision path); composite (UTR+amount+VPA) key to ' +
+      'survive NPCI RRN collisions; final exception report drives manual review.',
+    llm: 'off',
+    workflow: 'settlement-recon',
+    expected_resolution_days: 2,
+    sources: [
+      { adapterId: 'pg-yes-mis' },
+      { adapterId: 'pg-yes-incoming' },
+      { adapterId: 'pg-yes-consolidated' },
+      { adapterId: 'bank', accountId: 'yes-current' },
+      // internal-pg-db is currently a Phase 1.6 stub. When RECO_INTERNAL_PG_DB_URL
+      // is unset, leg 2 yields no matches — that's safe for pilot (rows still
+      // flow through the rest of the pipeline). Marked `optional: true` so the
+      // fetch step doesn't reject the whole run on empty.
+      // Production wires the DSN to activate the real py_id cross-check and
+      // we can drop the optional flag.
+      {
+        adapterId: 'internal-pg-db',
+        options: { pgName: 'yes', candidates: [] },
+        optional: true,
+      },
+      // NOTE: yes-auto-refunds is intentionally NOT a fetch-at-start source.
+      // It's a lookup-by-RRN: the deterministic-match step first runs the legs,
+      // finds the "Success in MIS but missing everywhere" RRNs, and queries
+      // open_prod for ONLY those RRNs (see workflow.ts → auto-refund lookup).
+    ],
+    matches: [], // empty — legs[] takes over
+    legs: [
+      {
+        id: 'leg-1-mis-vs-incoming',
+        name: 'PG MIS ↔ PG Incoming (composite key)',
+        description: 'Confirm each MIS row exists in our internal PG Incoming record. Composite key disambiguates RRN collisions.',
+        matches: [
+          {
+            name: 'mis_incoming_composite_exact',
+            ruleId: 'leg1_composite_exact_match',
+            from: 'pg-yes-mis',
+            to: 'pg-yes-incoming',
+            joinKey: { composite: ['utr', 'amountPaise', 'payerVpa'] },
+            // Per-field transforms: digits_only is right for the numeric RRN
+            // but destroys an alphanumeric UPI VPA (`name@bank` → '' →
+            // disqualified). Normalise the VPA with case + whitespace instead.
+            transformsByField: {
+              utr: ['digits_only', 'strip_whitespace'],
+              payerVpa: ['lowercase', 'strip_whitespace'],
+            },
+            strategy: 'exact',
+          },
+        ],
+        outputs: { carryForward: 'matched', asSource: 'leg1_matched' },
+      },
+      {
+        id: 'leg-2-internal-db-crosscheck',
+        name: 'Cross-check py_id in internal PG DB',
+        description: 'Looks up matched rows in our internal pg_transactions table to populate py_id. Stub in v1 — activates when RECO_INTERNAL_PG_DB_URL is set.',
+        matches: [
+          {
+            name: 'db_crosscheck_by_utr',
+            ruleId: 'leg2_db_crosscheck',
+            from: 'leg1_matched',
+            to: 'internal-pg-db',
+            joinKey: 'utr',
+            transforms: ['digits_only'],
+            strategy: 'exact',
+          },
+        ],
+        // Pass-through semantics for v1: the DB stub returns empty, so
+        // carryForward='all' means "matched-by-DB + everything not yet
+        // resolved" flows on. Once RECO_INTERNAL_PG_DB_URL is wired and the
+        // real lookup is implemented (Phase 3 follow-up), tighten this to
+        // 'matched' so only DB-confirmed rows reach leg 3.
+        outputs: { carryForward: 'all', asSource: 'leg2_matched' },
+      },
+      {
+        id: 'leg-3-antijoin-consolidated',
+        name: 'Anti-join against Consolidated (already-settled)',
+        description: 'Drops any row whose RRN+amount appears in the Consolidated already-settled report. We never re-settle.',
+        matches: [
+          {
+            name: 'antijoin_consolidated',
+            ruleId: 'leg3_excluded_in_consolidated',
+            from: 'leg2_matched',
+            to: 'pg-yes-consolidated',
+            joinKey: { composite: ['utr', 'amountPaise'] },
+            transforms: ['digits_only'],
+            strategy: 'exclude_if_present',
+          },
+        ],
+        outputs: { carryForward: 'unmatched', asSource: 'leg3_carried' },
+      },
+      {
+        id: 'leg-4-bank-settlement',
+        name: 'Match against YES Bank statement (batched)',
+        description: 'Confirms the cash arrived. YES Bank credits settlements in batches; we sum by settlementId and match the batch to a single bank credit.',
+        matches: [
+          {
+            name: 'bank_credit_by_utr',
+            ruleId: 'leg4_bank_credit_exact',
+            from: 'leg3_carried',
+            to: 'bank',
+            joinKey: 'utr',
+            transforms: ['digits_only'],
+            strategy: 'exact',
+          },
+        ],
+      },
+    ],
+  });
+
   console.log(
     '[reco] registered configs: bank-pg-internal, bank-pg-razorpay, bank-pg-cashfree, ' +
-    'restaurant-swiggy, restaurant-zomato, restaurant-zepto, erp-bank-tally'
+    'restaurant-swiggy, restaurant-zomato, restaurant-zepto, erp-bank-tally, settlement-yes-pg'
   );
 }
 

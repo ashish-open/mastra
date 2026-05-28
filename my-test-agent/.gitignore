@@ -13,3 +13,9 @@ knowledge.db*
 .netlify
 .vercel
 src/mastra/reconciliation/evals/results/
+
+# Reco PII masking — raw inputs, masked outputs, and salt must NEVER be committed.
+pii-raw/
+pii-masked/
+pii-salt.local
+run-reports/

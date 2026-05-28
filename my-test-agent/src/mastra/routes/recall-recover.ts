@@ -92,7 +92,8 @@ export const recallRecoverRoute: ApiRoute = {
         method: 'POST',
         headers: recallHeaders(),
         body: JSON.stringify({
-          provider: { recallai_async: { language_code: 'en' } },
+          // 'auto' enables language detection + code-switching (mixed-language calls).
+          provider: { recallai_async: { language_code: 'auto' } },
           diarization: { use_separate_streams_when_available: true },
         }),
       });
@@ -136,38 +137,43 @@ export const recallReprocessRoute: ApiRoute = {
 
     let transcriptId = body.transcriptId;
 
-    // If transcriptId not provided, look it up from the bot's recordings
+    // If transcriptId not provided, use Retrieve Bot → media_shortcuts.transcript.
+    // This is Recall's recommended pattern: one call instead of (list recordings
+    // → list transcripts per recording → pick one with status=done).
     if (!transcriptId) {
-      const recRes = await recallFetch(`${RECALL_BASE}/recording/?bot_id=${botId}`, {
+      const botRes = await recallFetch(`${RECALL_BASE}/bot/${botId}/`, {
         headers: recallHeaders(),
       });
-      if (!recRes.ok) {
-        return c.json({ error: `Failed to list recordings: ${await recRes.text()}` }, 500);
+      if (!botRes.ok) {
+        return c.json({ error: `Failed to retrieve bot: ${await botRes.text()}` }, 404);
       }
 
-      const recData = (await recRes.json()) as { results: { id: string }[] };
-      if (recData.results.length === 0) {
-        return c.json({ error: 'No recordings found for this bot' }, 404);
-      }
+      // The bot response includes `recordings` (an array) with each recording's
+      // `media_shortcuts.transcript`. Walk them and pick the first done one.
+      const bot = (await botRes.json()) as {
+        id: string;
+        recordings?: Array<{
+          id: string;
+          media_shortcuts?: {
+            transcript?: {
+              id: string;
+              status?: { code?: string };
+            } | null;
+          };
+        }>;
+      };
 
-      // Find the first recording that has a completed transcript
-      for (const recording of recData.results) {
-        const txListRes = await recallFetch(`${RECALL_BASE}/transcript/?recording_id=${recording.id}`, {
-          headers: recallHeaders(),
-        });
-        if (!txListRes.ok) continue;
-
-        const txList = (await txListRes.json()) as { results: { id: string; status: string }[] };
-        const done = txList.results.find(t => t.status === 'done');
-        if (done) {
-          transcriptId = done.id;
+      for (const recording of bot.recordings ?? []) {
+        const tx = recording.media_shortcuts?.transcript;
+        if (tx?.id && tx.status?.code === 'done') {
+          transcriptId = tx.id;
           break;
         }
       }
 
       if (!transcriptId) {
         return c.json({
-          error: 'No completed transcript found. Use /recall/recover/:botId to start transcription first.',
+          error: 'No completed transcript found via media_shortcuts. Use /recall/recover/:botId to start transcription first.',
         }, 404);
       }
     }

@@ -145,20 +145,57 @@ export const deployMeetingBot = createTool({
       );
     }
 
+    // recording_config does several things at once:
+    //   • transcript: post-meeting transcription auto-starts when recording finishes
+    //     — no separate create_transcript call needed (removes a failure mode).
+    //   • audio_mixed_mp3: archival audio so we can re-transcribe with a different
+    //     provider if recallai_async fails.
+    //   • meeting_metadata: get the platform's real meeting title (e.g. from Zoom),
+    //     better than our locally-supplied label.
+    //   • participant_events: join/leave timestamps for accurate attendance.
+    // Language 'auto' enables auto-detect + code-switching (matters for IN calls
+    // that mix English + Hindi/Marathi).
     const body = {
       meeting_url: meetingUrl,
       join_at: joinAt ?? new Date().toISOString(),
       bot_name: botName ?? 'Note Taker AI',
+      // Auto-leave when the bot is alone or the call goes silent.
+      // Without this, bots can sit forever if the host mutes them and walks away.
+      automatic_leave: {
+        // Leave 2 minutes after being the only one in the call
+        only_participant_in_meeting_timeout: 120,
+        // Leave 30 minutes after the meeting started if nobody else joined
+        waiting_room_timeout: 1800,
+        // Leave 10 minutes after the bot is the only audio source
+        silence_detection: { timeout: 600, activate_after: 60 },
+      },
+      recording_config: {
+        transcript: {
+          provider: {
+            recallai_async: { language_code: 'auto' },
+          },
+          diarization: {
+            // Perfect diarization — returns real participant names, not "Speaker A".
+            // Works on Zoom, Teams, Google Meet (not Webex).
+            use_separate_streams_when_available: true,
+          },
+        },
+        audio_mixed_mp3: {},
+        meeting_metadata: {},
+        participant_events: {},
+      },
       chat: {
         on_bot_join: {
           send_to: 'everyone',
           message: 'This meeting is being recorded and transcribed by Note Taker AI.',
+          // Note: pin only works on Google Meet. Zoom and Teams ignore it.
           pin: true,
         },
       },
-      // Metadata stored on the bot — retrieved in webhook handler
+      // Metadata stored on the bot — retrieved in webhook handler.
+      // Recall enforces string-only values, ≤500 chars per value.
       metadata: {
-        meetingTitle: meetingTitle ?? 'Untitled Meeting',
+        meetingTitle: (meetingTitle ?? 'Untitled Meeting').slice(0, 500),
         meetingType: meetingType ?? 'general',
       },
     };
@@ -187,37 +224,59 @@ export const deployMeetingBot = createTool({
 });
 
 // ─── Tool: Create Async Transcript ───────────────────────────────────────────
-// Called after recording.done webhook. Uses Recall.ai's own transcription provider.
+// NOTE: With recording_config.transcript set on bot creation, Recall auto-creates
+// the transcript when recording finishes. This tool is kept for the recovery flow
+// (when a webhook is missed, or when retrying a failed transcript with a fallback
+// provider). It also supports provider override for retry-with-different-provider.
+
+const ASYNC_PROVIDERS = ['recallai_async', 'deepgram_async', 'assembly_ai_async'] as const;
+type AsyncProvider = (typeof ASYNC_PROVIDERS)[number];
+
+export async function startAsyncTranscript(
+  recordingId: string,
+  provider: AsyncProvider = 'recallai_async',
+  languageCode: string = 'auto',
+): Promise<{ transcriptId: string; recordingId: string; provider: AsyncProvider }> {
+  // Each provider has slightly different config shape; we only set language_code.
+  // recallai_async + deepgram_async + assembly_ai_async all accept it.
+  const providerBody: Record<string, { language_code?: string }> = {};
+  providerBody[provider] = provider === 'assembly_ai_async'
+    ? {} // AssemblyAI uses different fields; default model handles language detection
+    : { language_code: languageCode };
+
+  const res = await recallFetch(`${RECALL_BASE}/recording/${recordingId}/create_transcript/`, {
+    method: 'POST',
+    headers: recallHeaders(),
+    body: JSON.stringify({
+      provider: providerBody,
+      diarization: { use_separate_streams_when_available: true },
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Recall.ai create_transcript failed (${res.status}): ${await res.text()}`);
+  }
+  const data = (await res.json()) as { id: string };
+  console.log(`[recall] Transcript job started: ${data.id} for recording ${recordingId} (provider: ${provider})`);
+  return { transcriptId: data.id, recordingId, provider };
+}
 
 export const createAsyncTranscript = createTool({
   id: 'create-async-transcript',
   description:
-    'Starts a post-meeting transcript job for a completed recording. Call this after receiving the recording.done webhook. Wait for transcript.done webhook before fetching the result.',
+    'Starts a post-meeting transcript job for a completed recording. Use only in recovery flows — normal meetings auto-transcribe via recording_config on bot creation.',
   inputSchema: z.object({
     recordingId: z.string().describe('Recording ID from the recording.done webhook payload'),
+    provider: z.enum(ASYNC_PROVIDERS).default('recallai_async').describe('Fallback provider for retries'),
+    languageCode: z.string().default('auto').describe('Language code or "auto" for detection'),
   }),
-  execute: async ({ recordingId }) => {
-    const res = await recallFetch(`${RECALL_BASE}/recording/${recordingId}/create_transcript/`, {
-      method: 'POST',
-      headers: recallHeaders(),
-      body: JSON.stringify({
-        provider: {
-          recallai_async: { language_code: 'en' },
-        },
-        diarization: {
-          use_separate_streams_when_available: true, // better speaker attribution for multi-person
-        },
-      }),
-    });
-
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`Recall.ai create_transcript failed (${res.status}): ${err}`);
-    }
-
-    const data = (await res.json()) as { id: string };
-    console.log(`[recall] Transcript job started: ${data.id} for recording ${recordingId}`);
-    return { transcriptId: data.id, recordingId };
+  execute: async ({ recordingId, provider, languageCode }) => {
+    const result = await startAsyncTranscript(
+      recordingId,
+      provider as AsyncProvider,
+      languageCode,
+    );
+    return { transcriptId: result.transcriptId, recordingId: result.recordingId };
   },
 });
 
@@ -253,20 +312,32 @@ export const fetchTranscriptById = createTool({
     }
 
     const transcript = (await dlRes.json()) as Array<{
-      speaker: string;
+      speaker?: string | null;
+      participant?: { id?: number; name?: string; is_host?: boolean } | null;
       words: { text: string; start_timestamp?: { relative: number }; end_timestamp?: { relative?: number } | null }[];
     }>;
+
+    // Recall uses `participant.name` for separate-stream transcription (speaker is null).
+    // Fall back to `speaker` for legacy/real-time transcription, then "Unknown".
+    function resolveSegmentSpeaker(seg: typeof transcript[0]): string {
+      const name = seg.participant?.name?.trim();
+      if (name && name.length > 0) return name;
+      const sp = seg.speaker?.trim();
+      if (sp && sp.length > 0) return sp;
+      return 'Unknown';
+    }
 
     // Convert to readable plain text grouped by speaker
     const plainText = transcript
       .map(seg => {
         const text = seg.words.map(w => w.text).join(' ').trim();
-        return text.length > 5 ? `${seg.speaker}: ${text}` : null;
+        const speaker = resolveSegmentSpeaker(seg);
+        return text.length > 5 ? `${speaker}: ${text}` : null;
       })
       .filter(Boolean)
       .join('\n') as string;
 
-    const speakers = new Set(transcript.map(s => s.speaker));
+    const speakers = new Set(transcript.map(s => resolveSegmentSpeaker(s)));
     const wordCount = transcript.reduce((acc, s) => acc + s.words.length, 0);
 
     return {

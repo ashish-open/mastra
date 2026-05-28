@@ -258,7 +258,11 @@ async function runDispositionEval(): Promise<{ dispositionAccuracy: CaseResult[]
     const dRes = await dispositionAccuracyScorer.run({
       input: { expectedRecommendation: c.expected.recommendation },
       output: { recommendation: out.recommendation, reasoning: out.reasoning },
-    });
+      // scorer compares against groundTruth.recommendation (not input) — see
+      // scorers.ts. Pass groundTruth explicitly so the CLI eval matches what
+      // the Studio dataset path provides.
+      groundTruth: { recommendation: c.expected.recommendation },
+    } as Parameters<typeof dispositionAccuracyScorer.run>[0]);
     const passed = dRes.score === 1;
     return {
       name: c.name, category: c.category, configId: c.configId, passed,

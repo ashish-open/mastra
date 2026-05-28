@@ -96,6 +96,14 @@ async function ensureSchema(): Promise<void> {
         ON reco_staged_transactions(config_id, adapter_id, date);
       CREATE INDEX IF NOT EXISTS idx_reco_stage_uploaded_at
         ON reco_staged_transactions(uploaded_at DESC);
+      -- Join index for dbListRecoDecisions' LEFT JOINs (which key on
+      -- config_id + date + source_id, WITHOUT adapter_id). The unique index
+      -- leads with (config_id, adapter_id, ...) so it can only serve the
+      -- config_id prefix here — meaning every decision row full-scanned the
+      -- staging table (O(decisions × staged) ≈ 20B ops at 145k×143k). This
+      -- index matches the join columns exactly → O(log n) lookups.
+      CREATE INDEX IF NOT EXISTS idx_reco_stage_join
+        ON reco_staged_transactions(config_id, date, source_id);
     `);
 
     // ─── Idempotent column-add migrations ──────────────────────────────────
@@ -113,6 +121,64 @@ async function ensureSchema(): Promise<void> {
     };
     // v2.1: structured decision metadata (batchId, batchSize, etc.)
     await safeAddColumn('ALTER TABLE reco_decisions ADD COLUMN metadata TEXT');
+
+    // v2.2 (Phase 1): add `mode` to staging table so a single config can hold
+    // separate UPI / CC / DC / NB files without colliding. The legacy table
+    // had `UNIQUE(config_id, adapter_id, date, source_id)`; the new
+    // partial unique index treats COALESCE(mode, '') as part of the key so
+    // legacy configs (mode=NULL) keep their existing one-row-per-slot
+    // semantics while multi-mode configs can stage multiple modes side-by-side.
+    //
+    // We rebuild the table only if `mode` column is absent (idempotent on
+    // already-migrated dbs).
+    {
+      const probe = await c.execute({
+        sql: "SELECT COUNT(*) AS c FROM pragma_table_info('reco_staged_transactions') WHERE name = 'mode'",
+        args: [],
+      });
+      const modeExists = Number((probe.rows[0] as unknown as { c: number | string }).c) > 0;
+      if (!modeExists) {
+        await c.batch(
+          [
+            // 1. Build a parallel table with the new schema (no table-level UNIQUE).
+            `CREATE TABLE reco_staged_transactions__v2 (
+               id             INTEGER PRIMARY KEY AUTOINCREMENT,
+               config_id      TEXT NOT NULL,
+               adapter_id     TEXT NOT NULL,
+               date           TEXT NOT NULL,
+               source_id      TEXT NOT NULL,
+               mode           TEXT,
+               payload        TEXT NOT NULL,
+               uploaded_at    TEXT NOT NULL,
+               uploaded_by    TEXT,
+               filename       TEXT
+             )`,
+            // 2. Copy legacy rows (mode = NULL).
+            `INSERT INTO reco_staged_transactions__v2
+               (id, config_id, adapter_id, date, source_id, mode, payload, uploaded_at, uploaded_by, filename)
+             SELECT id, config_id, adapter_id, date, source_id, NULL, payload, uploaded_at, uploaded_by, filename
+             FROM reco_staged_transactions`,
+            // 3. Swap.
+            'DROP TABLE reco_staged_transactions',
+            'ALTER TABLE reco_staged_transactions__v2 RENAME TO reco_staged_transactions',
+            // 4. Recreate non-unique lookup indexes.
+            `CREATE INDEX IF NOT EXISTS idx_reco_stage_lookup
+               ON reco_staged_transactions(config_id, adapter_id, date)`,
+            `CREATE INDEX IF NOT EXISTS idx_reco_stage_uploaded_at
+               ON reco_staged_transactions(uploaded_at DESC)`,
+            // Join index (config_id, date, source_id) — see ensureSchema note.
+            `CREATE INDEX IF NOT EXISTS idx_reco_stage_join
+               ON reco_staged_transactions(config_id, date, source_id)`,
+            // 5. New unique constraint — COALESCE(mode,'') so NULL collapses
+            // to a single deterministic slot per (config, adapter, date, source_id).
+            `CREATE UNIQUE INDEX IF NOT EXISTS idx_reco_stage_unique_v2
+               ON reco_staged_transactions(config_id, adapter_id, date, source_id, COALESCE(mode, ''))`,
+          ],
+          'write',
+        );
+        console.log('[reco-db] migrated reco_staged_transactions to v2 (added mode column + new unique index)');
+      }
+    }
 
     // v2.1: replace the full unique index on (date, source) with a partial one
     // that only enforces uniqueness across ACTIVE states. Without this, a
@@ -270,7 +336,49 @@ export async function dbWriteRecoDecisions(args: {
   return { runId: args.runId, written: args.decisions.length };
 }
 
+/**
+ * Flip a run's state to 'completed' without touching reco_decisions.
+ *
+ * Used by the workflow's writeDecisionsStep when decisions were already
+ * persisted earlier (settlement configs with llm='off' write inline inside
+ * deterministicMatchStep to keep the workflow snapshot small — calling
+ * dbWriteRecoDecisions again with an empty array would DELETE those rows).
+ */
+export async function dbMarkRunComplete(runId: string): Promise<void> {
+  await ensureSchema();
+  const c = getClient();
+  const now = new Date().toISOString();
+  await c.execute({
+    sql: `UPDATE reco_runs SET state = 'completed', updated_at = ? WHERE id = ?`,
+    args: [now, runId],
+  });
+}
+
 // ─── Read APIs (used by /integration/reco/* routes) ─────────────────────────
+
+/**
+ * Single-run lookup by id. Returns null when the run isn't in the DB —
+ * callers use this to surface a clean 404 / "Run not found" UI message.
+ */
+export async function dbGetRecoRun(runId: string): Promise<DBRecoRun | null> {
+  await ensureSchema();
+  const c = getClient();
+  const r = await c.execute({
+    sql: `SELECT id, date, source, state, created_at, updated_at
+          FROM reco_runs WHERE id = ? LIMIT 1`,
+    args: [runId],
+  });
+  if (r.rows.length === 0) return null;
+  const row = r.rows[0] as unknown as { id: string; date: string; source: string; state: DBRecoRun['state']; created_at: string; updated_at: string };
+  return {
+    id: row.id,
+    date: row.date,
+    source: row.source,
+    state: row.state,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
 
 export async function dbListRecoRuns(opts: { limit?: number } = {}): Promise<DBRecoRun[]> {
   await ensureSchema();
@@ -456,6 +564,28 @@ export async function dbDeleteStagedSlot(
   return { deleted: Number(r.rowsAffected ?? 0) };
 }
 
+/**
+ * Purge ALL staged rows for a (config, date) — every adapter slot.
+ *
+ * Called after a run's reports are written. Staged rows are parsed copies of
+ * the uploaded partner files and carry PII (VPAs, account numbers, names); we
+ * don't retain them once the run's deliverables (the two CSV reports) exist.
+ * Re-running the same (config, date) therefore requires re-uploading the
+ * source files — an accepted trade-off for not holding PII at rest.
+ */
+export async function dbPurgeStagedForRun(
+  configId: string,
+  date: string,
+): Promise<{ deleted: number }> {
+  await ensureSchema();
+  const c = getClient();
+  const r = await c.execute({
+    sql: 'DELETE FROM reco_staged_transactions WHERE config_id = ? AND date = ?',
+    args: [configId, date],
+  });
+  return { deleted: Number(r.rowsAffected ?? 0) };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -471,9 +601,14 @@ export async function dbDeleteStagedSlot(
  * staging row (the slot might've been cleared after the run). When that
  * happens the amount columns come back null and the UI renders '—'.
  */
-export async function dbListRecoDecisions(runId: string): Promise<DBRecoDecisionRow[]> {
+export async function dbListRecoDecisions(runId: string, limit?: number): Promise<DBRecoDecisionRow[]> {
   await ensureSchema();
   const c = getClient();
+  // Optional LIMIT — settlement runs emit 100k+ decisions; callers that only
+  // need a UI sample (OpenArc decisions table) pass a small limit to avoid
+  // fetching + serializing the full set. The report-pack builder passes no
+  // limit (it needs every row for 08_audit_log.csv).
+  const hasLimit = typeof limit === 'number' && limit > 0;
   const r = await c.execute({
     sql: `
       SELECT
@@ -489,8 +624,8 @@ export async function dbListRecoDecisions(runId: string): Promise<DBRecoDecision
       LEFT JOIN reco_staged_transactions tgt
         ON tgt.config_id = r.source AND tgt.date = r.date AND tgt.source_id = d.target_txn_id
       WHERE d.run_id = ?
-      ORDER BY d.id ASC`,
-    args: [runId],
+      ORDER BY d.id ASC${hasLimit ? ' LIMIT ?' : ''}`,
+    args: hasLimit ? [runId, limit] : [runId],
   });
 
   const parsePayload = (raw: unknown): { amountPaise: number | null; counterparty: string | null } => {

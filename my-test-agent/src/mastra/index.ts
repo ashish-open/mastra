@@ -16,15 +16,22 @@ import { DuckDBStore } from '@mastra/duckdb';
 import { Observability, DefaultExporter, CloudExporter, SensitiveDataFilter } from '@mastra/observability';
 import { deployMeetingBotWorkflow, processMeetingWorkflow } from './workflows/meeting-workflow';
 import { supportTriageWorkflow } from './workflows/support-triage-workflow';
-import { reconcileWorkflow } from './reconciliation/workflow';
+import { reconcileWorkflow, settlementReconWorkflow } from './reconciliation/workflow';
 // Ensure reco adapters + configs are registered at app startup
 import { ensureConfigsRegistered, RECO_CONFIGS_LOADED } from './reconciliation/configs';
 void RECO_CONFIGS_LOADED;
 ensureConfigsRegistered();
+
+// Ensure meetings DB schema is present on every startup (idempotent)
+void migrateMeetingsDb().catch(err => {
+  console.warn('[meetings-db] Migration failed (non-fatal):', err instanceof Error ? err.message : err);
+});
 import { zeusAgent } from './agents/zeus-agent';
 import { knowledgeAgent } from './agents/knowledge-agent';
 import { meetingAgent } from './agents/meeting-agent';
 import { supportTriageAgent } from './agents/support-triage-agent';
+import { supportAnalyzerAgent } from './agents/support-analyzer-agent';
+import { supportDrafterAgent } from './agents/support-drafter-agent';
 import { fuzzyMatchAgent, dispositionAgent } from './reconciliation/agents';
 import {
   candidateValidityScorer,
@@ -43,6 +50,7 @@ import { seedMeetingDataset } from './meeting-evals/seed-datasets';
 import { zeusDecisionAgent } from './zeus-evals/decision-agent';
 import { refusalAccuracyScorer } from './zeus-evals/scorers';
 import { seedZeusDataset } from './zeus-evals/seed-datasets';
+import { migrateMeetingsDb } from './meetings/db';
 import { recallWebhookRoute } from './routes/recall-webhook';
 import { recallRecoverRoute, recallReprocessRoute } from './routes/recall-recover';
 import { recallAskRoute } from './routes/recall-ask';
@@ -53,7 +61,13 @@ import {
   integrationInfoRoute,
   integrationRecoRunsRoute,
   integrationRecoDecisionsRoute,
+  integrationMeetingsListRoute,
+  integrationMeetingDetailRoute,
 } from './routes/integration';
+import {
+  integrationRecoReportPackManifestRoute,
+  integrationRecoReportPackFileRoute,
+} from './routes/reco-report-pack';
 
 export const mastra = new Mastra({
   workflows: {
@@ -61,12 +75,15 @@ export const mastra = new Mastra({
     processMeetingWorkflow,
     supportTriageWorkflow,
     reconcileWorkflow,
+    settlementReconWorkflow,
   },
   agents: {
     zeusAgent,
     knowledgeAgent,
     meetingAgent,
     supportTriageAgent,
+    supportAnalyzerAgent,
+    supportDrafterAgent,
     supportClassifierAgent,
     meetingActionItemExtractorAgent,
     zeusDecisionAgent,
@@ -99,6 +116,10 @@ export const mastra = new Mastra({
       integrationInfoRoute,
       integrationRecoRunsRoute,
       integrationRecoDecisionsRoute,
+      integrationRecoReportPackManifestRoute,
+      integrationRecoReportPackFileRoute,
+      integrationMeetingsListRoute,
+      integrationMeetingDetailRoute,
     ],
   },
   storage: new MastraCompositeStore({

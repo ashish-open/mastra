@@ -11,13 +11,26 @@
 import type { NormalizedTxn, RecoDecision } from './types.js';
 import {
   dbOpenRecoRun,
+  dbGetRecoRun,
   dbWriteRecoDecisions,
   dbStageTransactions,
   dbGetStagedTransactions,
   dbListStagedSources,
   dbDeleteStagedSlot,
+  dbListRecoDecisions,
   type StagedSourceSummary,
+  type DBRecoRun,
 } from './db.js';
+
+/** Look up a single reco run by id, or null when not found. */
+export async function getRecoRun(runId: string): Promise<DBRecoRun | null> {
+  return dbGetRecoRun(runId);
+}
+
+/** All persisted decisions for a run, ordered by insertion. */
+export async function listRecoDecisions(runId: string) {
+  return dbListRecoDecisions(runId);
+}
 
 export async function openRecoRun(args: {
   date: string;

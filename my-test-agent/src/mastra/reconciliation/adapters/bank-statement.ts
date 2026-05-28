@@ -79,6 +79,22 @@ function parseCSV(body: string, source: string): NormalizedTxn[] {
   //   (c) separate credit/debit    — headers `credit` + `debit` (standard HDFC/ICICI/Axis exports)
   const hasPaise = headers.includes('amount_paise');
   const hasCreditDebit = headers.includes('credit') && headers.includes('debit');
+  const hasAmount = headers.includes('amount');
+
+  // Surface a clear diagnostic when no amount shape was detected. Without this,
+  // the adapter silently returns [] and the upload route says "Parsed 0
+  // transactions" with no indication of WHY. Common cause: the uploaded file
+  // is actually a PG MIS / transaction report rather than a bank statement.
+  if (!hasPaise && !hasCreditDebit && !hasAmount) {
+    throw new Error(
+      `Bank Statement parser found no amount column. Detected headers: ` +
+      `[${headers.slice(0, 12).join(', ')}${headers.length > 12 ? ', …' : ''}]. ` +
+      `Expected one of: 'amount_paise', 'amount' (+ optional 'type'), or 'credit'+'debit'. ` +
+      `If this is a PG transaction report (not a bank credit/debit statement), it should be ` +
+      `uploaded to the 'pg-yes-mis' source instead. If it IS a bank statement with a different ` +
+      `column name, tell engineering the file's amount-column header so we can add an alias.`,
+    );
+  }
 
   const txns: NormalizedTxn[] = [];
   for (let i = 1; i < lines.length; i++) {
@@ -103,13 +119,24 @@ function parseCSV(body: string, source: string): NormalizedTxn[] {
 
     // Skip header-like rows that produced zero amount AND no UTR (defensive
     // against trailing summary lines some banks include).
-    const utr = col(row, 'utr', 'reference', 'ref_no', 'ref no.', 'rrn') ?? null;
+    //
+    // Column-name aliases:
+    // - YES Bank statements use `URN` and `BANKREFERENCENUMBER` (whichever is
+    //   populated) for the RRN — neither matches the conventional `utr`/`rrn`.
+    //   Accept both alongside the standard names. See TERMINOLOGY.md.
+    const utr = col(
+      row,
+      'utr', 'reference', 'ref_no', 'ref no.', 'rrn',
+      'bankreferencenumber', 'bank reference number', 'urn',
+    ) ?? null;
     if (amountPaise === 0 && !utr) continue;
 
     txns.push({
       sourceId: `bank_${source}_${i}_${utr ?? 'noutr'}`,
       source: 'bank',
-      date: normalizeDate(col(row, 'date', 'transaction_date', 'txn_date', 'txn date', 'value_date', 'value date')),
+      // YES uses `TXN_DATE` / `VALUE_DATE` / `DAT_POST`; HDFC/Axis use the
+      // friendlier `transaction_date` / `value_date`. Try all.
+      date: normalizeDate(col(row, 'date', 'transaction_date', 'txn_date', 'txn date', 'txn_date', 'value_date', 'value date', 'dat_post')),
       amountPaise,
       utr,
       description: col(row, 'description', 'narration', 'particulars') ?? '',
@@ -118,7 +145,34 @@ function parseCSV(body: string, source: string): NormalizedTxn[] {
       raw: { ...Object.fromEntries(headers.map((h, j) => [h, row[j]])), _bank: source },
     });
   }
+  // If we recognized a shape but emitted zero rows, surface a diagnostic
+  // instead of silently returning []. Lines>1 means there were data rows; if
+  // they all got skipped it's usually a UTR-column miss or an amount column
+  // that parses to 0 throughout.
+  if (txns.length === 0 && lines.length > 1) {
+    throw new Error(
+      `Bank Statement parser found ${lines.length - 1} data rows but extracted 0 transactions. ` +
+      `Detected headers: [${headers.slice(0, 12).join(', ')}${headers.length > 12 ? ', …' : ''}]. ` +
+      `Most rows were skipped (amount=0 and no UTR). ` +
+      `Check that your amount column actually has values and the reference column matches one of: ` +
+      `utr / reference / ref_no / rrn / bankreferencenumber / urn.`,
+    );
+  }
   return txns;
+}
+
+/** Render a ParsedCsv row set back to a CSV string so the existing parseCSV()
+ *  pipeline (with all its per-bank shape detection) can consume it unchanged.
+ *  Cheap intermediate — runs once per upload, small files. */
+function rowsToCsvBody(headers: string[], rows: Record<string, string | number>[]): string {
+  const esc = (v: unknown) => {
+    if (v === null || v === undefined) return '';
+    const s = String(v);
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const headerLine = headers.map(esc).join(',');
+  const bodyLines = rows.map(r => headers.map(h => esc(r[h])).join(','));
+  return [headerLine, ...bodyLines].join('\n');
 }
 
 export const bankStatementAdapter: SourceAdapter = {
@@ -128,13 +182,27 @@ export const bankStatementAdapter: SourceAdapter = {
   // No fetch() — Indian banks don't expose daily-statement APIs publicly.
   async parseFile(file: Buffer, mime: string, ctx: SourceAdapterContext): Promise<NormalizedTxn[]> {
     const source = ctx.accountId ?? 'bank';
-    const text = file.toString('utf-8');
-    if (mime === 'text/csv' || mime === 'application/csv' || mime.endsWith('csv') || mime.includes('text/plain')) {
-      return parseCSV(text, source);
+    const isCsv = mime === 'text/csv' || mime === 'application/csv' || mime.endsWith('csv') || mime.includes('text/plain');
+    if (isCsv) {
+      return parseCSV(file.toString('utf-8'), source);
+    }
+    const isXlsx =
+      mime.includes('spreadsheetml') ||
+      mime.includes('officedocument') ||
+      mime.endsWith('xlsx') ||
+      mime === 'application/vnd.ms-excel';
+    if (isXlsx) {
+      // Parse XLSX preserving leading zeros, then synthesize a CSV body so
+      // the per-bank parseCSV pipeline (credit/debit detection, URN/UTR
+      // aliases, etc.) doesn't need its own XLSX-aware variant.
+      const { parseXlsxAsStrings } = await import('./_csv-utils.js');
+      const parsed = await parseXlsxAsStrings(file, { lowercaseHeaders: false });
+      const body = rowsToCsvBody(parsed.headers, parsed.rows);
+      return parseCSV(body, source);
     }
     throw new Error(
-      `Bank statement parser doesn't support mime '${mime}' yet. CSV is supported; ` +
-      `xlsx/pdf are TODO — convert the statement to CSV from your bank portal for now.`
+      `Bank statement parser doesn't support mime '${mime}'. CSV + XLSX are supported; ` +
+      `PDF is TODO.`
     );
   },
 };
