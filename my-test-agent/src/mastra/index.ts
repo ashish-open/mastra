@@ -17,10 +17,17 @@ import { Observability, DefaultExporter, CloudExporter, SensitiveDataFilter } fr
 import { deployMeetingBotWorkflow, processMeetingWorkflow } from './workflows/meeting-workflow';
 import { supportTriageWorkflow } from './workflows/support-triage-workflow';
 import { reconcileWorkflow, settlementReconWorkflow } from './reconciliation/workflow';
+import { dbQueryWorkflow } from './db-query/workflow';
+import { dbAnalystAgent, dbNarratorAgent } from './db-query/agents';
+import { registerDbQueryConnections } from './db-query/bootstrap';
 // Ensure reco adapters + configs are registered at app startup
 import { ensureConfigsRegistered, RECO_CONFIGS_LOADED } from './reconciliation/configs';
 void RECO_CONFIGS_LOADED;
 ensureConfigsRegistered();
+
+// Register db-query Postgres connections from env (read-only roles).
+// Idempotent + non-fatal: skips connections whose DSN env var is unset.
+registerDbQueryConnections();
 
 // Ensure meetings DB schema is present on every startup (idempotent)
 void migrateMeetingsDb().catch(err => {
@@ -68,6 +75,7 @@ import {
   integrationRecoReportPackManifestRoute,
   integrationRecoReportPackFileRoute,
 } from './routes/reco-report-pack';
+import { dbQueryAskRoute, dbQueryRefreshSchemaRoute } from './routes/db-query';
 
 export const mastra = new Mastra({
   workflows: {
@@ -76,6 +84,7 @@ export const mastra = new Mastra({
     supportTriageWorkflow,
     reconcileWorkflow,
     settlementReconWorkflow,
+    dbQueryWorkflow,
   },
   agents: {
     zeusAgent,
@@ -89,6 +98,8 @@ export const mastra = new Mastra({
     zeusDecisionAgent,
     fuzzyMatchAgent,
     dispositionAgent,
+    dbAnalystAgent,
+    dbNarratorAgent,
   },
   scorers: {
     candidateValidityScorer,
@@ -120,6 +131,9 @@ export const mastra = new Mastra({
       integrationRecoReportPackFileRoute,
       integrationMeetingsListRoute,
       integrationMeetingDetailRoute,
+      // db-query agent — NL→SQL question answering
+      dbQueryAskRoute,
+      dbQueryRefreshSchemaRoute,
     ],
   },
   storage: new MastraCompositeStore({

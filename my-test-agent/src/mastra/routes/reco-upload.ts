@@ -42,6 +42,13 @@ ensureConfigsRegistered();
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+// Defense-in-depth size cap on direct callers (OpenArc's multer enforces
+// the primary cap before reaching Mastra). Override via RECO_UPLOAD_MAX_MB.
+// Hono streams formData() into memory; a buffer-side check is cheaper than
+// post-hoc, but we still verify length once we have the File handle.
+const RECO_UPLOAD_MAX_MB = Math.max(1, parseInt(process.env.RECO_UPLOAD_MAX_MB ?? '100', 10) || 100);
+const RECO_UPLOAD_MAX_BYTES = RECO_UPLOAD_MAX_MB * 1024 * 1024;
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type HonoCtx = any;
 
@@ -68,6 +75,16 @@ export const recoUploadRoute: ApiRoute = {
     if (!adapterId) return c.json({ error: "missing 'adapterId'" }, 400);
     if (!DATE_RE.test(date)) return c.json({ error: "missing or invalid 'date' (YYYY-MM-DD)" }, 400);
     if (!file) return c.json({ error: "missing 'file'" }, 400);
+
+    // Size gate — reject before pulling the full ArrayBuffer into memory.
+    // File.size is set by the runtime from Content-Length / multipart bytes.
+    if (typeof file.size === 'number' && file.size > RECO_UPLOAD_MAX_BYTES) {
+      return c.json({
+        error: 'LIMIT_FILE_SIZE',
+        message: `File too large. Maximum upload size is ${RECO_UPLOAD_MAX_MB} MB.`,
+        limitMb: RECO_UPLOAD_MAX_MB,
+      }, 413);
+    }
 
     // Validate configId is registered AND adapterId is one of its sources —
     // catches typos that would otherwise stage rows the workflow can never read.

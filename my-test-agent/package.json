@@ -6,6 +6,7 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "ingest": "node --env-file=.env --import tsx/esm src/mastra/knowledge/ingest.ts",
     "eval:reco": "node --env-file=.env --import tsx/esm src/mastra/reconciliation/evals/run-eval.ts",
+    "eval:db-query": "node --env-file=.env --import tsx/esm src/mastra/db-query/evals/run-eval.ts",
     "eval:reco:exp": "node --env-file=.env --import tsx/esm src/mastra/reconciliation/evals/run-experiment.ts",
     "eval:triage:exp": "node --env-file=.env --import tsx/esm src/mastra/support-triage-evals/run-experiment.ts",
     "eval:knowledge:exp": "node --env-file=.env --import tsx/esm src/mastra/knowledge-evals/run-experiment.ts",
